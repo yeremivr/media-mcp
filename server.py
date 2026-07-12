@@ -41,11 +41,13 @@ import uuid
 import time
 import base64
 import shlex
+import socket
 import asyncio
 import shutil
 import threading
 import subprocess
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 
 import yt_dlp
@@ -166,6 +168,31 @@ FFMPEG_PATH = _find_ffmpeg()
 
 
 # ==========================================================================
+# PO TOKEN (bgutil). OPCIONAL: si el proveedor bgutil esta corriendo, el plugin
+# `bgutil-ytdlp-pot-provider` (instalado aparte) dota a yt-dlp de PO Tokens
+# frescos para los clientes web/tv/mweb -> YouTube deja de limitar a 360p. Aqui
+# solo DETECTAMOS si el proveedor escucha, para reportarlo en health. La
+# extraccion no cambia: la cascada ya usa esos clientes. Si el proveedor no
+# esta, todo sigue igual (4K por client-juggling). Deteccion best-effort.
+# ==========================================================================
+
+POT_PROVIDER_URL = os.environ.get("BGUTIL_POT_BASE_URL", "http://127.0.0.1:4416")
+
+
+def _pot_provider_reachable() -> bool:
+    """True si el proveedor de PO Token (bgutil) esta escuchando en su host:
+    puerto. Best-effort: abre un socket con timeout corto y no lanza nunca."""
+    try:
+        u = urlparse(POT_PROVIDER_URL)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or 4416
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except Exception:
+        return False
+
+
+# ==========================================================================
 # NOTIFICACION NATIVA (Termux). Fuera de Termux -> no-op (portable).
 # ==========================================================================
 
@@ -266,7 +293,8 @@ def _is_youtube(url: str) -> bool:
 # eso _extract_info recorre varios y se queda con la MAYOR resolucion (no con el
 # primero que responda). 'tv' a veces cae en el experimento DRM "solo
 # miniaturas" (yt-dlp #12563) -> _has_real_formats lo detecta y lo descarta.
-# Anadir PO Token (plugin bgutil) seria una estrategia mas aqui si hiciera falta.
+# Si el proveedor bgutil (PO Token) esta activo, los clientes web/tv/mweb
+# reciben tokens frescos automaticamente -> ya no los limitan a 360p.
 YOUTUBE_STRATEGIES = [
     {"name": "default", "player_client": None,               "use_cookies": False},
     {"name": "tv",      "player_client": ["tv"],             "use_cookies": False},
@@ -726,6 +754,7 @@ def health_check() -> dict:
             "ffmpeg": bool(FFMPEG_PATH),
             "notifications": bool(_TERMUX_NOTIFY),
             "media_scan": bool(_TERMUX_MEDIA_SCAN),
+            "po_token": _pot_provider_reachable(),
             "youtube_strategy": _CHAMPION["name"],
             "max_height": _max_height(info),
             "download_dir": str(DOWNLOAD_DIR),
@@ -736,6 +765,7 @@ def health_check() -> dict:
                 "cookies": bool(COOKIES_FILE), "ffmpeg": bool(FFMPEG_PATH),
                 "notifications": bool(_TERMUX_NOTIFY),
                 "media_scan": bool(_TERMUX_MEDIA_SCAN),
+                "po_token": _pot_provider_reachable(),
                 "youtube_strategy": _CHAMPION["name"], **_friendly_error(e)}
 
 
@@ -753,6 +783,7 @@ async def api_health(request):
         "ffmpeg": bool(FFMPEG_PATH),
         "notifications": bool(_TERMUX_NOTIFY),
         "media_scan": bool(_TERMUX_MEDIA_SCAN),
+        "po_token": _pot_provider_reachable(),
         "youtube_strategy": _CHAMPION["name"],
     }, headers=CORS_HEADERS)
 

@@ -172,6 +172,9 @@ _TERMUX_NOTIFY = shutil.which("termux-notification")
 # Ruta ABSOLUTA de termux-open: la accion de la notificacion corre con
 # `dash -c` SIN $PATH, asi que no podemos depender del nombre suelto.
 _TERMUX_OPEN = shutil.which("termux-open")
+# Escaner de medios de Android (Termux:API): registra el archivo en el
+# MediaStore para que aparezca en la Galeria/reproductor (ver _media_scan).
+_TERMUX_MEDIA_SCAN = shutil.which("termux-media-scan")
 
 
 def _notify(job_id: str, title: str, body: str, filepath: str | None = None):
@@ -191,6 +194,26 @@ def _notify(job_id: str, title: str, body: str, filepath: str | None = None):
             # + path con comillas seguras (anti-inyeccion via el titulo).
             cmd += ["--action", f"{_TERMUX_OPEN} {shlex.quote(str(filepath))}"]
         subprocess.run(cmd, timeout=15, check=False,
+                       stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _media_scan(filepath: str | None):
+    """Avisa a Android (MediaStore) que hay un archivo NUEVO para que aparezca
+    de inmediato en la Galeria y el reproductor de musica.
+
+    yt-dlp escribe el archivo por la via de shell y eso NO dispara el
+    MediaScanner de Android: el archivo existe en el disco pero el MediaStore
+    (el indice del que leen Galeria/Musica) no lo conoce, asi que no se ve
+    hasta reiniciar el telefono. `termux-media-scan` fuerza ese indexado.
+    Fuera de Termux (o si falla) es un no-op: jamas debe tumbar la descarga."""
+    if not _TERMUX_MEDIA_SCAN or not filepath:
+        return
+    try:
+        subprocess.run([_TERMUX_MEDIA_SCAN, "-r", str(filepath)],
+                       timeout=30, check=False,
                        stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -447,6 +470,9 @@ def _download_worker(job: dict):
             "updated_at": _now(),
         })
         _upsert_job(job)
+        # Registrar en el MediaStore ANTES de notificar: asi, al tocar la
+        # notificacion, el video ya es visible en la Galeria/reproductor.
+        _media_scan(filepath)
         body = ("Guardado en tu galeria (Descargas/Cauce)." if in_gallery
                 else "Descarga lista.")
         _notify(job_id, f"✅ {job.get('title') or 'Video'}", body, filepath=filepath)
@@ -587,6 +613,7 @@ def health_check() -> dict:
             "cookies": bool(COOKIES_FILE),
             "ffmpeg": bool(FFMPEG_PATH),
             "notifications": bool(_TERMUX_NOTIFY),
+            "media_scan": bool(_TERMUX_MEDIA_SCAN),
             "youtube_strategy": _CHAMPION["name"],
             "download_dir": str(DOWNLOAD_DIR),
             "title": info.get("title"),
@@ -595,6 +622,7 @@ def health_check() -> dict:
         return {"ok": False, "js_engine": "deno" if DENO_PATH else "none",
                 "cookies": bool(COOKIES_FILE), "ffmpeg": bool(FFMPEG_PATH),
                 "notifications": bool(_TERMUX_NOTIFY),
+                "media_scan": bool(_TERMUX_MEDIA_SCAN),
                 "youtube_strategy": _CHAMPION["name"], **_friendly_error(e)}
 
 
@@ -611,6 +639,7 @@ async def api_health(request):
         "cookies": bool(COOKIES_FILE),
         "ffmpeg": bool(FFMPEG_PATH),
         "notifications": bool(_TERMUX_NOTIFY),
+        "media_scan": bool(_TERMUX_MEDIA_SCAN),
         "youtube_strategy": _CHAMPION["name"],
     }, headers=CORS_HEADERS)
 

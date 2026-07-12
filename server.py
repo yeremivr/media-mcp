@@ -3,25 +3,48 @@ media-mcp: servidor MCP remoto que envuelve yt-dlp + API web para la PWA "Cauce"
 
 Herramientas MCP para Claude (capa de razonamiento):
   - list_formats(url): metadata + formatos (rapido, no descarga)
-  - download(url, format_id): descarga y registra el job
+  - download(url, format_id): dispara la descarga (en segundo plano) y avisa
+  - download_status(job_id?): estado de una descarga (o de las ultimas)
   - health_check(): estado de yt-dlp
 
 API web para la PWA (capa 'ultimo kilometro', mismo origen que el servidor):
   - GET /                    -> la PWA Cauce (archivos estaticos de ./pwa)
   - GET /api/health          -> estado del servidor
-  - GET /api/jobs            -> lista de descargas listas
-  - GET /api/file/{job_id}   -> entrega el archivo al telefono
+  - GET /api/jobs            -> lista de descargas (con estado)
+  - GET /api/file/{job_id}   -> entrega el archivo (util solo en modo remoto)
   - GET /icon-192.png, /icon-512.png -> iconos de la PWA (desde icons.py)
 
 El endpoint MCP para Claude queda en  /mcp
+
+--------------------------------------------------------------------------
+ARQUITECTURA "Cauce Soberano" (Fase 1):
+El muro anti-bot de YouTube tiene DOS causas: (1) falta de PO Token y (2) IP
+de datacenter. La solucion de raiz es correr en IP residencial/movil (un
+telefono con Termux). Este server es PORTABLE (Termux / PC / Render) y anade:
+
+  * CASCADA AUTO-SANADORA de "player clients": prueba varios en orden,
+    reintenta SOLO ante el muro anti-bot, APRENDE cual funciona y lidera con
+    ese la proxima vez. En IP residencial la 1a suele bastar sin cookies.
+  * DESCARGA EN SEGUNDO PLANO (fire-and-forget con espera breve): las
+    descargas cortas responden al instante; las largas siguen en background.
+  * NOTIFICACION NATIVA de Android al terminar (termux-notification), con
+    tap-para-abrir el video. Fuera de Termux es un no-op (sigue portable).
+  * Guarda en la carpeta Descargas COMPARTIDA del telefono -> aparece en la
+    galeria y NO viaja por el tunel (plano de datos = local). Asi Cauce (la
+    PWA) deja de ser necesaria: "se lo pides a Claude y aparece en tu galeria".
+--------------------------------------------------------------------------
 """
 
 import os
 import json
 import uuid
+import time
 import base64
+import shlex
 import asyncio
 import shutil
+import threading
+import subprocess
 from pathlib import Path
 
 import yt_dlp
@@ -36,15 +59,34 @@ except Exception:
     ICON_192_B64 = ICON_512_B64 = ""
 
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
+
+
+def _default_download_dir() -> Path:
+    """Elige donde guardar. En Termux (telefono) guarda en la carpeta de
+    Descargas COMPARTIDA: asi el video aparece en tu galeria, sobrevive al
+    cierre de la app y NO viaja por el tunel (plano de datos = local)."""
+    env = os.environ.get("DOWNLOAD_DIR")
+    if env:
+        return Path(env)
+    # ~/storage/downloads existe si se corrio `termux-setup-storage`.
+    termux_dl = Path(os.path.expanduser("~/storage/downloads"))
+    if termux_dl.exists():
+        return termux_dl / "Cauce"
+    return BASE_DIR / "downloads"
+
+
+DOWNLOAD_DIR = _default_download_dir()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_INDEX = DOWNLOAD_DIR / "_jobs.json"
 PWA_DIR = BASE_DIR / "pwa"
 
 PORT = int(os.environ.get("PORT", 8000))
 
-# CORS: permite que la PWA lea el API aunque se sirva desde otro origen
-# (ej. GitHub Pages). Si se sirve desde el mismo servidor, no estorba.
+# Cuantos segundos espera `download` a que termine antes de responder
+# "sigue en segundo plano". Clips cortos terminan dentro de esta ventana.
+DOWNLOAD_WAIT_SECONDS = float(os.environ.get("DOWNLOAD_WAIT_SECONDS", "8"))
+
+# CORS: permite que la PWA lea el API aunque se sirva desde otro origen.
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -58,7 +100,9 @@ def _find_deno() -> str | None:
         shutil.which("deno"),
         str(BASE_DIR / ".deno" / "bin" / "deno"),
         os.path.expanduser("~/.deno/bin/deno"),
-        "/opt/render/.deno/bin/deno",
+        os.path.expanduser("~/.local/bin/deno"),
+        "/data/data/com.termux/files/usr/bin/deno",   # Termux (telefono)
+        "/opt/render/.deno/bin/deno",                  # Render (datacenter)
         "/opt/render/project/src/.deno/bin/deno",
     ]
     for c in candidates:
@@ -69,18 +113,12 @@ def _find_deno() -> str | None:
 
 DENO_PATH = _find_deno()
 if DENO_PATH:
-    # Con Deno en el PATH, yt-dlp lo detecta y lo usa solo para YouTube.
     os.environ["PATH"] = os.path.dirname(DENO_PATH) + os.pathsep + os.environ.get("PATH", "")
 
 
 def _find_cookies_source() -> str | None:
-    """Ubicacion del cookies.txt para YouTube.
-
-    Desde IPs de datacenter (como Render) YouTube responde a algunos videos con
-    'Sign in to confirm you're not a bot'. Eso SOLO se resuelve con cookies de
-    una sesion de YouTube. Sube un cookies.txt como Secret File en Render (o pon
-    YT_COOKIES_FILE con su ruta) y el servidor lo usa automaticamente.
-    """
+    """Ubicacion del cookies.txt para YouTube. En IP residencial/movil casi
+    NUNCA hace falta; se mantiene como ultimo recurso de la cascada."""
     candidates = [
         os.environ.get("YT_COOKIES_FILE"),
         "/etc/secrets/cookies.txt",
@@ -93,13 +131,9 @@ def _find_cookies_source() -> str | None:
 
 
 def _prepare_cookies() -> str | None:
-    """Devuelve un cookies.txt ESCRIBIBLE.
-
-    yt-dlp reescribe el cookiefile al terminar cada extraccion. Si apunta a un
-    Secret File de Render (montado en /etc/secrets, solo lectura) revienta con
-    'Read-only file system' y rompe TODAS las descargas. Por eso copiamos el
-    archivo a una ruta escribible al arrancar y usamos esa copia.
-    """
+    """Devuelve un cookies.txt ESCRIBIBLE. yt-dlp reescribe el cookiefile al
+    cerrar; si apunta a un Secret File de solo lectura (/etc/secrets) revienta
+    con 'Read-only file system'. Por eso copiamos a una ruta escribible."""
     src = _find_cookies_source()
     if not src:
         return None
@@ -108,7 +142,6 @@ def _prepare_cookies() -> str | None:
         shutil.copyfile(src, dst)
         return str(dst)
     except Exception:
-        # Si no se pudo copiar, es mejor no usar cookies que tumbar el servidor.
         return None
 
 
@@ -123,67 +156,287 @@ except Exception:
 
 
 def _find_ffmpeg() -> str | None:
-    """Ruta a ffmpeg, para unir video + audio de formatos DASH (Instagram,
-    YouTube en HD, etc. vienen con las pistas separadas). Sin ffmpeg esos
-    videos saldrian SIN audio. imageio-ffmpeg trae un binario listo via pip."""
+    """Ruta a ffmpeg (une video+audio de formatos DASH). En Termux:
+    `pkg install ffmpeg`. Si no, imageio-ffmpeg trae un binario via pip."""
     return shutil.which("ffmpeg") or _IMAGEIO_FFMPEG
 
 
 FFMPEG_PATH = _find_ffmpeg()
 
 
-def _base_opts() -> dict:
-    """Opciones base de yt-dlp. Deno (si existe) se autodetecta via PATH.
-    Si hay cookies.txt, se usan (necesarias para YouTube desde un servidor)."""
-    opts = {"quiet": True, "no_warnings": True}
-    if COOKIES_FILE:
-        opts["cookiefile"] = COOKIES_FILE
+# ==========================================================================
+# NOTIFICACION NATIVA (Termux). Fuera de Termux -> no-op (portable).
+# ==========================================================================
+
+_TERMUX_NOTIFY = shutil.which("termux-notification")
+# Ruta ABSOLUTA de termux-open: la accion de la notificacion corre con
+# `dash -c` SIN $PATH, asi que no podemos depender del nombre suelto.
+_TERMUX_OPEN = shutil.which("termux-open")
+
+
+def _notify(job_id: str, title: str, body: str, filepath: str | None = None):
+    """Lanza una notificacion de Android. Nunca debe tumbar la descarga:
+    si falla o no hay Termux, simplemente no hace nada."""
+    if not _TERMUX_NOTIFY:
+        return
+    try:
+        nid = str(int(job_id[:6], 16) % 100000)   # id estable por job
+        cmd = [_TERMUX_NOTIFY,
+               "--id", nid,
+               "--priority", "high",
+               "--title", title,
+               "--content", body]              # obligatorio: si no, espera stdin 3s
+        if filepath and _TERMUX_OPEN:
+            # `--action` se ejecuta con dash -c: ruta ABSOLUTA de termux-open
+            # + path con comillas seguras (anti-inyeccion via el titulo).
+            cmd += ["--action", f"{_TERMUX_OPEN} {shlex.quote(str(filepath))}"]
+        subprocess.run(cmd, timeout=15, check=False,
+                       stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+# ==========================================================================
+# CASCADA AUTO-SANADORA DE YOUTUBE
+# ==========================================================================
+
+def _is_youtube(url: str) -> bool:
+    u = (url or "").lower()
+    return "youtube.com" in u or "youtu.be" in u or "youtube-nocookie.com" in u
+
+
+# Estrategias en orden de preferencia. Anadir PO Token luego es trivial
+# (instalar el plugin bgutil y, si se quiere, sumar una estrategia aqui).
+YOUTUBE_STRATEGIES = [
+    {"name": "tv",          "player_client": ["tv"],         "use_cookies": False},
+    {"name": "web_safari",  "player_client": ["web_safari"], "use_cookies": False},
+    {"name": "mweb",        "player_client": ["mweb"],       "use_cookies": False},
+    {"name": "web_cookies", "player_client": ["web"],        "use_cookies": True},
+]
+
+# Auto-aprendizaje: la ultima estrategia que funciono se prueba PRIMERO la
+# proxima vez -> en regimen normal, 1 solo intento aunque YouTube cambie.
+_CHAMPION = {"name": None}
+
+# Cache por-URL en la sesion: lo que list_formats descubrio lo reusa download.
+_URL_STRATEGY: dict = {}
+
+# El telefono tiene recursos limitados: no dejar que descargas pesadas se
+# peleen la CPU/red a la vez. Semaforo simple (2 en paralelo, configurable).
+_DL_SEMAPHORE = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_DL", "2")))
+
+
+def _ordered_strategies() -> list:
+    """Estrategias con la 'campeona' (ultima que funciono) al frente."""
+    champ = _CHAMPION["name"]
+    if not champ:
+        return list(YOUTUBE_STRATEGIES)
+    lead = [s for s in YOUTUBE_STRATEGIES if s["name"] == champ]
+    rest = [s for s in YOUTUBE_STRATEGIES if s["name"] != champ]
+    return lead + rest
+
+
+def _classify_error(e: Exception) -> str:
+    """Clasifica el error de yt-dlp para decidir el siguiente paso:
+      - 'hard'    : privado/borrado/geo -> NO reintentar (no tiene arreglo)
+      - 'auth'    : edad/inicio de sesion -> hacen falta cookies
+      - 'botwall' : muro anti-bot / SABR -> probar el siguiente cliente"""
+    m = str(e).lower()
+    if any(k in m for k in (
+        "private video", "video unavailable", "has been removed", "removed by",
+        "does not exist", "not available in your country", "blocked it in your country",
+        "members-only", "join this channel", "this live event",
+    )):
+        return "hard"
+    if any(k in m for k in (
+        "confirm your age", "age-restricted", "sign in to confirm your age",
+        "inappropriate for some users",
+    )):
+        return "auth"
+    if any(k in m for k in (
+        "confirm you're not a bot", "confirm you’re not a bot", "not a bot",
+        "sign in to confirm", "only images are available", "forcing sabr",
+        "failed to extract any player response", "unable to extract",
+    )):
+        return "botwall"
+    return "botwall"   # desconocido: una oportunidad mas con otro cliente
+
+
+def _base_opts(strategy: dict | None = None) -> dict:
+    """Opciones base de yt-dlp, endurecidas para red movil inestable.
+    strategy=None (TikTok/IG/etc.): cookies si existen, sin forzar cliente.
+    Para YouTube se pasa la estrategia de la cascada."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,       # comparten un video dentro de playlist -> solo el video
+        "retries": 5,             # red movil se corta -> reintentar
+        "fragment_retries": 10,
+        "continuedl": True,       # reanudar en vez de reempezar
+        "socket_timeout": 30,
+    }
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
+
+    use_cookies = True if strategy is None else strategy.get("use_cookies", False)
+    if COOKIES_FILE and use_cookies:
+        opts["cookiefile"] = COOKIES_FILE
+
+    if strategy and strategy.get("player_client"):
+        opts["extractor_args"] = {"youtube": {"player_client": strategy["player_client"]}}
     return opts
 
 
+def _run_resilient(url: str, action, remember_for_url: bool = False):
+    """Ejecuta action(opts).
+    - YouTube: recorre la cascada (campeona/ cache-por-URL primero); reintenta
+      SOLO ante muro anti-bot; respeta errores 'duros'.
+    - Otras plataformas: un solo intento (con cookies si hay)."""
+    if not _is_youtube(url):
+        return action(_base_opts(None))
+
+    cached = _URL_STRATEGY.get(url)
+    if cached:
+        strategies = [cached] + [s for s in _ordered_strategies() if s["name"] != cached["name"]]
+    else:
+        strategies = _ordered_strategies()
+
+    last_err = None
+    for st in strategies:
+        try:
+            result = action(_base_opts(st))
+            _CHAMPION["name"] = st["name"]
+            if remember_for_url:
+                _URL_STRATEGY[url] = st
+            return result
+        except Exception as e:
+            if _classify_error(e) == "hard":
+                raise
+            last_err = e
+            continue
+    raise last_err if last_err else RuntimeError("YouTube: ninguna estrategia funciono")
+
+
 def _friendly_error(e: Exception) -> dict:
-    """Traduce el error crudo de yt-dlp. Detecta el muro anti-bot de YouTube
-    para que Claude explique la causa real en vez de mostrar un error tecnico."""
-    msg = str(e)
-    low = msg.lower()
-    if "confirm you" in low or "sign in to confirm" in low or "not a bot" in low:
-        return {
-            "ok": False,
-            "needs_cookies": True,
-            "error": ("YouTube pide verificacion anti-bot para este video. Desde un "
-                      "servidor eso solo se resuelve subiendo cookies de YouTube (ver "
-                      "el README, seccion 'Cookies de YouTube'). Otras plataformas como "
-                      "TikTok, Instagram o Facebook no tienen este problema."),
-        }
-    return {"ok": False, "error": f"No se pudo leer el link: {msg}"}
+    """Traduce el error crudo de yt-dlp segun su clasificacion."""
+    kind = _classify_error(e)
+    if kind == "hard":
+        return {"ok": False,
+                "error": "Ese video no se puede descargar: es privado, fue borrado, "
+                         "es solo para miembros o no esta disponible en tu region."}
+    if kind == "auth":
+        return {"ok": False, "needs_cookies": True,
+                "error": "Este video tiene restriccion de edad y pide inicio de sesion. "
+                         "Hacen falta cookies de una cuenta de YouTube."}
+    if kind == "botwall":
+        return {"ok": False, "needs_cookies": True,
+                "error": ("YouTube pidio verificacion anti-bot y ninguna estrategia lo paso. "
+                          "Desde IP residencial/movil es raro; desde un datacenter es esperado "
+                          "(por eso Cauce corre mejor en tu telefono). TikTok, Instagram y "
+                          "Facebook no tienen este problema.")}
+    return {"ok": False, "error": f"No se pudo leer el link: {e}"}
 
 
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
 
 
 def _extract_info(url: str) -> dict:
-    opts = _base_opts()
-    opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    def action(opts):
+        o = dict(opts)
+        o["skip_download"] = True
+        with yt_dlp.YoutubeDL(o) as ydl:
+            return ydl.extract_info(url, download=False)
+    return _run_resilient(url, action, remember_for_url=True)
 
 
-def _load_jobs() -> list:
+# ---- Registro de jobs (con lock: varios hilos escriben el mismo JSON) ----
+
+_JOBS_LOCK = threading.Lock()
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_jobs_unlocked() -> list:
     if JOBS_INDEX.exists():
         try:
-            return json.loads(JOBS_INDEX.read_text())
+            return json.loads(JOBS_INDEX.read_text(encoding="utf-8"))
         except Exception:
             return []
     return []
 
 
-def _record_job(job: dict):
-    jobs = _load_jobs()
-    jobs.insert(0, job)
-    jobs = jobs[:50]
-    JOBS_INDEX.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
+def _load_jobs() -> list:
+    with _JOBS_LOCK:
+        return _read_jobs_unlocked()
+
+
+def _upsert_job(job: dict):
+    """Inserta o actualiza un job por job_id (read-modify-write bajo lock)."""
+    with _JOBS_LOCK:
+        jobs = [j for j in _read_jobs_unlocked() if j.get("job_id") != job["job_id"]]
+        jobs.insert(0, job)
+        jobs = jobs[:50]
+        JOBS_INDEX.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _JOBS_LOCK:
+        for j in _read_jobs_unlocked():
+            if j.get("job_id") == job_id:
+                return j
+    return None
+
+
+# ---- Motor de descarga (corre en un hilo de fondo) ----
+
+def _do_download(job_id: str, url: str, format_id: str):
+    """Descarga real con yt-dlp, bajo el semaforo y via la cascada."""
+    out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
+
+    def action(opts):
+        o = dict(opts)
+        o["format"] = format_id
+        o["outtmpl"] = out_template
+        o["merge_output_format"] = "mp4"
+        o["windowsfilenames"] = True   # nombres seguros para almacenamiento del telefono
+        with yt_dlp.YoutubeDL(o) as ydl:
+            info = ydl.extract_info(url, download=True)
+            reqd = info.get("requested_downloads") or []
+            filepath = reqd[-1].get("filepath") if reqd else ydl.prepare_filename(info)
+            return info, filepath
+
+    with _DL_SEMAPHORE:
+        return _run_resilient(url, action)
+
+
+def _download_worker(job: dict):
+    """Ejecuta la descarga, actualiza el estado del job y notifica al terminar.
+    Captura TODO: un fallo aqui jamas debe matar el hilo en silencio."""
+    job_id = job["job_id"]
+    try:
+        info, filepath = _do_download(job_id, job["url"], job["format_id"])
+        in_gallery = "storage/downloads" in str(filepath).replace("\\", "/")
+        job.update({
+            "status": "done",
+            "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader") or info.get("channel"),
+            "ext": Path(filepath).suffix.lstrip("."),
+            "file_path": filepath,
+            "updated_at": _now(),
+        })
+        _upsert_job(job)
+        body = ("Guardado en tu galeria (Descargas/Cauce)." if in_gallery
+                else "Descarga lista.")
+        _notify(job_id, f"✅ {job.get('title') or 'Video'}", body, filepath=filepath)
+    except Exception as e:
+        fe = _friendly_error(e)
+        job.update({"status": "error", "error": fe.get("error", str(e)), "updated_at": _now()})
+        _upsert_job(job)
+        _notify(job_id, "❌ No se pudo descargar", (fe.get("error") or str(e))[:120])
 
 
 # --------------------------------------------------------------------------
@@ -249,52 +502,64 @@ def list_formats(url: str) -> dict:
 @mcp.tool()
 def download(url: str, format_id: str) -> dict:
     """
-    Descarga el link en el format_id elegido y registra el job para la PWA.
+    Dispara la descarga del link en el format_id elegido. La descarga corre en
+    SEGUNDO PLANO: si termina rapido responde "listo"; si tarda, responde que
+    sigue en background y al terminar salta una notificacion en el telefono.
 
     Args:
         url: el link original.
         format_id: el format_id devuelto por list_formats.
     """
     job_id = str(uuid.uuid4())[:8]
-    out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
-
-    opts = _base_opts()
-    opts["format"] = format_id
-    opts["outtmpl"] = out_template
-    opts["merge_output_format"] = "mp4"
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            reqd = info.get("requested_downloads") or []
-            filepath = reqd[-1].get("filepath") if reqd else ydl.prepare_filename(info)
-    except Exception as e:
-        fe = _friendly_error(e)
-        if fe.get("needs_cookies"):
-            return fe
-        return {"ok": False, "error": f"Fallo la descarga: {e}"}
-
     job = {
         "job_id": job_id,
-        "file_path": filepath,
-        "title": info.get("title"),
-        "thumbnail": info.get("thumbnail"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "ext": Path(filepath).suffix.lstrip("."),
+        "url": url,
+        "format_id": format_id,
+        "status": "downloading",
+        "title": None,
+        "created_at": _now(),
+        "updated_at": _now(),
     }
-    _record_job(job)
+    _upsert_job(job)
 
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "title": info.get("title"),
-        "message": "Descarga lista. Abre la app Cauce para guardarla en tu telefono.",
-    }
+    t = threading.Thread(target=_download_worker, args=(job,), daemon=True)
+    t.start()
+    t.join(timeout=DOWNLOAD_WAIT_SECONDS)   # espera breve: clips cortos terminan aqui
+
+    fresh = _get_job(job_id) or job
+    status = fresh.get("status")
+
+    if status == "done":
+        return {"ok": True, "job_id": job_id, "status": "done",
+                "title": fresh.get("title"),
+                "message": "Descarga lista y guardada en tu telefono."}
+    if status == "error":
+        return {"ok": False, "job_id": job_id, "status": "error",
+                "error": fresh.get("error")}
+    return {"ok": True, "job_id": job_id, "status": "downloading",
+            "message": "Bajandolo en segundo plano. Te llega una notificacion al terminar."}
+
+
+@mcp.tool()
+def download_status(job_id: str = "") -> dict:
+    """
+    Consulta el estado de una descarga por job_id, o las ultimas si no se pasa.
+
+    Args:
+        job_id: (opcional) el id devuelto por download().
+    """
+    if job_id:
+        j = _get_job(job_id)
+        if not j:
+            return {"ok": False, "error": "job no encontrado"}
+        return {"ok": True, "job": {k: v for k, v in j.items() if k != "file_path"}}
+    jobs = _load_jobs()
+    return {"ok": True, "jobs": [{k: v for k, v in j.items() if k != "file_path"} for j in jobs[:10]]}
 
 
 @mcp.tool()
 def health_check() -> dict:
-    """Prueba rapida de que yt-dlp sigue funcionando."""
+    """Prueba rapida de que yt-dlp sigue funcionando (via la cascada)."""
     try:
         info = _extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         return {
@@ -303,15 +568,20 @@ def health_check() -> dict:
             "js_engine": "deno" if DENO_PATH else "none",
             "cookies": bool(COOKIES_FILE),
             "ffmpeg": bool(FFMPEG_PATH),
+            "notifications": bool(_TERMUX_NOTIFY),
+            "youtube_strategy": _CHAMPION["name"],
+            "download_dir": str(DOWNLOAD_DIR),
             "title": info.get("title"),
         }
     except Exception as e:
         return {"ok": False, "js_engine": "deno" if DENO_PATH else "none",
-                "cookies": bool(COOKIES_FILE), "ffmpeg": bool(FFMPEG_PATH), "error": str(e)}
+                "cookies": bool(COOKIES_FILE), "ffmpeg": bool(FFMPEG_PATH),
+                "notifications": bool(_TERMUX_NOTIFY),
+                "youtube_strategy": _CHAMPION["name"], **_friendly_error(e)}
 
 
 # --------------------------------------------------------------------------
-# API web (capa 'ultimo kilometro': la consume la PWA Cauce)
+# API web (capa 'ultimo kilometro': la consume la PWA Cauce, ahora opcional)
 # --------------------------------------------------------------------------
 
 @mcp.custom_route("/api/health", methods=["GET"])
@@ -322,6 +592,8 @@ async def api_health(request):
         "js_engine": "deno" if DENO_PATH else "none",
         "cookies": bool(COOKIES_FILE),
         "ffmpeg": bool(FFMPEG_PATH),
+        "notifications": bool(_TERMUX_NOTIFY),
+        "youtube_strategy": _CHAMPION["name"],
     }, headers=CORS_HEADERS)
 
 
@@ -342,7 +614,7 @@ async def api_file(request):
             if fp and os.path.exists(fp):
                 return FileResponse(fp, filename=os.path.basename(fp), headers=CORS_HEADERS)
             return JSONResponse(
-                {"ok": False, "error": "El archivo ya no esta en el servidor (se reinicio). Vuelve a pedir la descarga."},
+                {"ok": False, "error": "El archivo ya no esta disponible. Vuelve a pedir la descarga."},
                 status_code=410, headers=CORS_HEADERS,
             )
     return JSONResponse({"ok": False, "error": "job no encontrado"}, status_code=404, headers=CORS_HEADERS)
@@ -361,7 +633,6 @@ async def icon_512(request):
 
 
 if __name__ == "__main__":
-    import threading
     import uvicorn
     from starlette.routing import Mount
     from starlette.staticfiles import StaticFiles
@@ -372,8 +643,8 @@ if __name__ == "__main__":
     # App ASGI: incluye /mcp (para Claude) y /api/* + /icon-*.png (custom_route).
     app = mcp.streamable_http_app()
 
-    # Sirve la PWA Cauce en la raiz. Se agrega al final para que /mcp, /api/* e
-    # /icon-*.png tengan prioridad; cualquier otra ruta cae en los estaticos.
+    # Sirve la PWA Cauce en la raiz (opcional: historial/biblioteca). Se agrega
+    # al final para que /mcp, /api/* e /icon-*.png tengan prioridad.
     if PWA_DIR.exists():
         app.router.routes.append(
             Mount("/", app=StaticFiles(directory=str(PWA_DIR), html=True), name="pwa")

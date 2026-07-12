@@ -73,9 +73,52 @@ if DENO_PATH:
     os.environ["PATH"] = os.path.dirname(DENO_PATH) + os.pathsep + os.environ.get("PATH", "")
 
 
+def _find_cookies() -> str | None:
+    """Cookies opcionales para YouTube.
+
+    Desde IPs de datacenter (como Render) YouTube responde a algunos videos con
+    'Sign in to confirm you're not a bot'. Eso SOLO se resuelve con cookies de
+    una sesion de YouTube. Sube un cookies.txt como Secret File en Render (o pon
+    YT_COOKIES_FILE con su ruta) y el servidor lo usa automaticamente.
+    """
+    candidates = [
+        os.environ.get("YT_COOKIES_FILE"),
+        "/etc/secrets/cookies.txt",
+        str(BASE_DIR / "cookies.txt"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+COOKIES_FILE = _find_cookies()
+
+
 def _base_opts() -> dict:
-    """Opciones base de yt-dlp. Deno (si existe) se detecta solo via PATH."""
-    return {"quiet": True, "no_warnings": True}
+    """Opciones base de yt-dlp. Deno (si existe) se autodetecta via PATH.
+    Si hay cookies.txt, se usan (necesarias para YouTube desde un servidor)."""
+    opts = {"quiet": True, "no_warnings": True}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def _friendly_error(e: Exception) -> dict:
+    """Traduce el error crudo de yt-dlp. Detecta el muro anti-bot de YouTube
+    para que Claude explique la causa real en vez de mostrar un error tecnico."""
+    msg = str(e)
+    low = msg.lower()
+    if "confirm you" in low or "sign in to confirm" in low or "not a bot" in low:
+        return {
+            "ok": False,
+            "needs_cookies": True,
+            "error": ("YouTube pide verificacion anti-bot para este video. Desde un "
+                      "servidor eso solo se resuelve subiendo cookies de YouTube (ver "
+                      "el README, seccion 'Cookies de YouTube'). Otras plataformas como "
+                      "TikTok, Instagram o Facebook no tienen este problema."),
+        }
+    return {"ok": False, "error": f"No se pudo leer el link: {msg}"}
 
 
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
@@ -120,7 +163,7 @@ def list_formats(url: str) -> dict:
     try:
         info = _extract_info(url)
     except Exception as e:
-        return {"ok": False, "error": f"No se pudo leer el link: {e}"}
+        return _friendly_error(e)
 
     raw_formats = info.get("formats", []) or []
     curated = []
@@ -183,6 +226,9 @@ def download(url: str, format_id: str) -> dict:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
     except Exception as e:
+        fe = _friendly_error(e)
+        if fe.get("needs_cookies"):
+            return fe
         return {"ok": False, "error": f"Fallo la descarga: {e}"}
 
     job = {
@@ -212,10 +258,12 @@ def health_check() -> dict:
             "ok": True,
             "yt_dlp_version": yt_dlp.version.__version__,
             "js_engine": "deno" if DENO_PATH else "none",
+            "cookies": bool(COOKIES_FILE),
             "title": info.get("title"),
         }
     except Exception as e:
-        return {"ok": False, "js_engine": "deno" if DENO_PATH else "none", "error": str(e)}
+        return {"ok": False, "js_engine": "deno" if DENO_PATH else "none",
+                "cookies": bool(COOKIES_FILE), "error": str(e)}
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +276,7 @@ async def api_health(request):
         "ok": True,
         "yt_dlp_version": yt_dlp.version.__version__,
         "js_engine": "deno" if DENO_PATH else "none",
+        "cookies": bool(COOKIES_FILE),
     }, headers=CORS_HEADERS)
 
 

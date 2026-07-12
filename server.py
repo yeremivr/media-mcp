@@ -1,16 +1,17 @@
 """
-media-mcp: servidor MCP remoto que envuelve yt-dlp.
+media-mcp: servidor MCP remoto que envuelve yt-dlp + API web para la PWA.
 
-Expone herramientas a Claude:
-  - list_formats(url): consulta metadata + formatos disponibles (rápido, no descarga)
-  - download(url, format_id): descarga y convierte en el formato elegido
-  - health_check(): prueba que yt-dlp sigue funcionando
+Herramientas MCP para Claude:
+  - list_formats(url): metadata + formatos (rapido, no descarga)
+  - download(url, format_id): descarga y registra el job
+  - health_check(): estado de yt-dlp
 
-Diseñado para correr como servidor HTTP (transporte 'streamable-http'),
-que es lo que necesita un Custom Connector remoto en Claude.
+API web para la PWA:
+  - GET /api/jobs, /api/file/{job_id}, /api/health
 """
 
 import os
+import json
 import uuid
 import asyncio
 from pathlib import Path
@@ -20,33 +21,37 @@ from mcp.server.fastmcp import FastMCP
 
 from auto_updater import run_forever as run_auto_updater
 
-# --- Configuración ---
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+JOBS_INDEX = DOWNLOAD_DIR / "_jobs.json"
 
-# El puerto lo define la plataforma de hosting (Render/Railway) via env var PORT.
 PORT = int(os.environ.get("PORT", 8000))
 
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
 
 
 def _extract_info(url: str) -> dict:
-    """Consulta metadata + formatos SIN descargar. Es la llamada rápida (1-3s)."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def _record_job(job: dict):
+    jobs = []
+    if JOBS_INDEX.exists():
+        try:
+            jobs = json.loads(JOBS_INDEX.read_text())
+        except Exception:
+            jobs = []
+    jobs.insert(0, job)
+    jobs = jobs[:50]
+    JOBS_INDEX.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
 
 
 @mcp.tool()
 def list_formats(url: str) -> dict:
     """
     Consulta un link (TikTok, Instagram, YouTube, Facebook, etc.) y devuelve
-    metadata (título, autor, miniatura, duración) + una lista curada de
-    formatos disponibles para descargar, con tamaño estimado.
+    metadata (titulo, autor, miniatura, duracion) + formatos disponibles.
 
     Args:
         url: el link compartido por el usuario.
@@ -56,11 +61,9 @@ def list_formats(url: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"No se pudo leer el link: {e}"}
 
-    # yt-dlp devuelve decenas de formatos técnicos; los curamos a algo legible.
     raw_formats = info.get("formats", []) or []
     curated = []
 
-    # Mejor formato de audio solo
     audio_only = [f for f in raw_formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
     if audio_only:
         best_audio = max(audio_only, key=lambda f: f.get("abr") or 0)
@@ -71,7 +74,6 @@ def list_formats(url: str) -> dict:
             "filesize_mb": round((best_audio.get("filesize") or best_audio.get("filesize_approx") or 0) / 1_000_000, 1),
         })
 
-    # Formatos de video con audio incluido, deduplicados por resolución
     video_formats = [f for f in raw_formats if f.get("vcodec") != "none"]
     seen_res = set()
     for f in sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True):
@@ -85,7 +87,7 @@ def list_formats(url: str) -> dict:
             "label": f"{height}p ({f.get('ext')})",
             "filesize_mb": round((f.get("filesize") or f.get("filesize_approx") or 0) / 1_000_000, 1),
         })
-        if len(seen_res) >= 4:  # top 4 resoluciones basta
+        if len(seen_res) >= 4:
             break
 
     return {
@@ -101,8 +103,7 @@ def list_formats(url: str) -> dict:
 @mcp.tool()
 def download(url: str, format_id: str) -> dict:
     """
-    Descarga el link en el format_id elegido (obtenido previamente de list_formats)
-    y lo guarda en el servidor. Devuelve un job_id y la ruta del archivo final.
+    Descarga el link en el format_id elegido y registra el job para la PWA.
 
     Args:
         url: el link original.
@@ -111,12 +112,7 @@ def download(url: str, format_id: str) -> dict:
     job_id = str(uuid.uuid4())[:8]
     out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
 
-    ydl_opts = {
-        "format": format_id,
-        "outtmpl": out_template,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    ydl_opts = {"format": format_id, "outtmpl": out_template, "quiet": True, "no_warnings": True}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -125,35 +121,35 @@ def download(url: str, format_id: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Fallo la descarga: {e}"}
 
-    return {
-        "ok": True,
+    job = {
         "job_id": job_id,
         "file_path": filepath,
         "title": info.get("title"),
+        "thumbnail": info.get("thumbnail"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "ext": Path(filepath).suffix.lstrip("."),
+    }
+    _record_job(job)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "title": info.get("title"),
+        "message": "Descarga lista. Abre la app Cauce para guardarla en tu telefono.",
     }
 
 
 @mcp.tool()
 def health_check() -> dict:
-    """Prueba rápida de que yt-dlp sigue funcionando (para el cron de monitoreo)."""
-    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    """Prueba rapida de que yt-dlp sigue funcionando."""
     try:
-        info = _extract_info(test_url)
+        info = _extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         return {"ok": True, "yt_dlp_version": yt_dlp.version.__version__, "title": info.get("title")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":
-    # Nota: mcp.run() maneja su propio event loop internamente, así que el
-    # auto-actualizador se lanza en un hilo aparte para no pelear con él.
     import threading
-
-    def _updater_thread():
-        asyncio.run(run_auto_updater())
-
-    threading.Thread(target=_updater_thread, daemon=True).start()
-
-    # Transporte HTTP streamable: esto es lo que Claude necesita para
-    # conectarse como Custom Connector remoto (no stdio local).
+    threading.Thread(target=lambda: asyncio.run(run_auto_updater()), daemon=True).start()
     mcp.run(transport="streamable-http")

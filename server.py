@@ -115,12 +115,31 @@ def _prepare_cookies() -> str | None:
 COOKIES_FILE = _prepare_cookies()
 
 
+try:
+    import imageio_ffmpeg
+    _IMAGEIO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    _IMAGEIO_FFMPEG = None
+
+
+def _find_ffmpeg() -> str | None:
+    """Ruta a ffmpeg, para unir video + audio de formatos DASH (Instagram,
+    YouTube en HD, etc. vienen con las pistas separadas). Sin ffmpeg esos
+    videos saldrian SIN audio. imageio-ffmpeg trae un binario listo via pip."""
+    return shutil.which("ffmpeg") or _IMAGEIO_FFMPEG
+
+
+FFMPEG_PATH = _find_ffmpeg()
+
+
 def _base_opts() -> dict:
     """Opciones base de yt-dlp. Deno (si existe) se autodetecta via PATH.
     Si hay cookies.txt, se usan (necesarias para YouTube desde un servidor)."""
     opts = {"quiet": True, "no_warnings": True}
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
+    if FFMPEG_PATH:
+        opts["ffmpeg_location"] = FFMPEG_PATH
     return opts
 
 
@@ -206,9 +225,11 @@ def list_formats(url: str) -> dict:
             continue
         seen_res.add(height)
         curated.append({
-            "format_id": f["format_id"],
+            # Selector que une el video con el mejor audio (los DASH vienen
+            # con las pistas separadas); asi la descarga sale CON sonido.
+            "format_id": f"{f['format_id']}+bestaudio/best",
             "kind": "video",
-            "label": f"{height}p ({f.get('ext')})",
+            "label": f"{height}p (mp4)",
             "filesize_mb": round((f.get("filesize") or f.get("filesize_approx") or 0) / 1_000_000, 1),
         })
         if len(seen_res) >= 4:
@@ -240,11 +261,13 @@ def download(url: str, format_id: str) -> dict:
     opts = _base_opts()
     opts["format"] = format_id
     opts["outtmpl"] = out_template
+    opts["merge_output_format"] = "mp4"
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
+            reqd = info.get("requested_downloads") or []
+            filepath = reqd[-1].get("filepath") if reqd else ydl.prepare_filename(info)
     except Exception as e:
         fe = _friendly_error(e)
         if fe.get("needs_cookies"):
@@ -279,11 +302,12 @@ def health_check() -> dict:
             "yt_dlp_version": yt_dlp.version.__version__,
             "js_engine": "deno" if DENO_PATH else "none",
             "cookies": bool(COOKIES_FILE),
+            "ffmpeg": bool(FFMPEG_PATH),
             "title": info.get("title"),
         }
     except Exception as e:
         return {"ok": False, "js_engine": "deno" if DENO_PATH else "none",
-                "cookies": bool(COOKIES_FILE), "error": str(e)}
+                "cookies": bool(COOKIES_FILE), "ffmpeg": bool(FFMPEG_PATH), "error": str(e)}
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +321,7 @@ async def api_health(request):
         "yt_dlp_version": yt_dlp.version.__version__,
         "js_engine": "deno" if DENO_PATH else "none",
         "cookies": bool(COOKIES_FILE),
+        "ffmpeg": bool(FFMPEG_PATH),
     }, headers=CORS_HEADERS)
 
 

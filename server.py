@@ -5,7 +5,18 @@ Herramientas MCP para Claude (capa de razonamiento):
   - list_formats(url): metadata + formatos (rapido, no descarga)
   - download(url, format_id): dispara la descarga (en segundo plano) y avisa
   - download_status(job_id?): estado de una descarga (o de las ultimas)
-  - health_check(): estado de yt-dlp
+  - resolve_media(url): resuelve con el MOTOR ESTRUCTURAL (grafo+scoring), util
+       para LinkedIn/Facebook/sitios sin extractor, con diagnostico transparente
+  - preview_thumbnail(url): baja la miniatura y la devuelve como IMAGEN (Claude
+       la ve) — funciona porque el telefono SI llega al CDN que Claude tiene vetado
+  - health_check(): estado de yt-dlp + del resolver
+
+RED DE SEGURIDAD ESTRUCTURAL (resolver.py): cuando yt-dlp no tiene extractor o
+su extractor se rompe (el HTML del sitio cambio), el motor `resolver` baja el
+HTML, lo convierte en un GRAFO de islas (DOM + JSON embebido), y PUNTUA cada URL
+candidata por patron-de-valor (CDN, extension, firma) + contexto estructural
+(claves hermanas width/height/bitrate, ancestros video/media). Robusto a que la
+plataforma renombre o reanide sus claves. Ver resolver.py para el algoritmo.
 
 API web para la PWA (capa 'ultimo kilometro', mismo origen que el servidor):
   - GET /                    -> la PWA Cauce (archivos estaticos de ./pwa)
@@ -52,6 +63,12 @@ from pathlib import Path
 
 import yt_dlp
 from mcp.server.fastmcp import FastMCP
+try:
+    # Image permite que una tool devuelva una imagen INCRUSTADA (para que Claude
+    # pueda "ver" la miniatura). Guardado por si cambia entre versiones de mcp.
+    from mcp.server.fastmcp import Image
+except Exception:
+    Image = None
 from starlette.responses import JSONResponse, FileResponse, Response
 
 from auto_updater import run_forever as run_auto_updater
@@ -60,6 +77,15 @@ try:
     from icons import ICON_192_B64, ICON_512_B64
 except Exception:
     ICON_192_B64 = ICON_512_B64 = ""
+
+# Motor estructural de resolucion (resolver.py): RED DE SEGURIDAD para cuando
+# yt-dlp no tiene extractor o su extractor se rompe (LinkedIn, Facebook y demas
+# sitios sin soporte mantenido). Import GUARDADO: si fallara, el server arranca
+# igual y solo se pierde el fallback; TODO lo de yt-dlp sigue intacto.
+try:
+    import resolver as _resolver
+except Exception:
+    _resolver = None
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -467,7 +493,39 @@ def _extract_once(url: str, strategy: dict | None) -> dict:
 
 
 def _extract_info(url: str) -> dict:
-    """Extrae metadata + formatos.
+    """Extrae metadata + formatos, con RED DE SEGURIDAD estructural.
+
+    yt-dlp va PRIMERO (rapido y mantenido). Para enlaces que NO son YouTube, si
+    yt-dlp no tiene extractor o su extractor se rompio (no devuelve formatos
+    usables), caemos al `resolver` estructural (grafo + scoring del HTML).
+    YouTube NO usa el resolver: sus URLs de googlevideo necesitan el descifrado
+    de firma que solo yt-dlp sabe hacer, y ese camino ya tiene su cascada."""
+    ytdlp_err = None
+    try:
+        info = _extract_info_ytdlp(url)
+        if _is_youtube(url) or _has_real_formats(info):
+            return info
+    except Exception as e:
+        if _classify_error(e) == "hard":
+            raise
+        ytdlp_err = e
+
+    if not _is_youtube(url) and _resolver is not None:
+        try:
+            res = _resolver.resolve(url)
+        except Exception:
+            res = None
+        if res is not None and getattr(res, "ok", False):
+            return res.to_info()
+
+    if ytdlp_err is not None:
+        raise ytdlp_err
+    raise RuntimeError("No encontre formatos descargables para este enlace "
+                       "(ni con yt-dlp ni con el resolver estructural).")
+
+
+def _extract_info_ytdlp(url: str) -> dict:
+    """Extrae metadata + formatos SOLO con yt-dlp (la logica original).
 
     - Otras plataformas (TikTok/IG/etc.): una sola extraccion.
     - YouTube: prueba varias estrategias de 'player_client' y SE QUEDA CON LA
@@ -544,8 +602,62 @@ def _get_job(job_id: str) -> dict | None:
 
 # ---- Motor de descarga (corre en un hilo de fondo) ----
 
+def _do_download_resolved(job_id: str, url: str, format_id: str):
+    """Descarga para formatos del RESOLVER estructural (`cauce-...`).
+
+    Re-resuelve el enlace EN EL MOMENTO: las URLs firmadas de los CDN
+    (fbcdn/licdn) expiran en horas, asi que no se puede reusar la que se mostro
+    en list_formats. Elige la calidad pedida y baja la URL DIRECTA con yt-dlp
+    (que igual hace el merge/HLS/DASH). El titulo/miniatura/autor los pone el
+    resolver, porque yt-dlp sobre una URL pelada de CDN no los conoce."""
+    res = _resolver.resolve(url)
+    if not getattr(res, "ok", False):
+        raise RuntimeError(res.reason or "El resolver no encontro el medio al descargar.")
+
+    kind = "audio" if format_id.startswith("cauce-a") else "video"
+    tail = format_id.rsplit("-", 1)[-1]
+    want_h = int(tail) if (kind == "video" and tail.isdigit()) else None
+
+    fmts = [f for f in res.formats if f.kind == kind] or list(res.formats)
+    if not fmts:
+        raise RuntimeError("El resolver no devolvio formatos al descargar.")
+    if kind == "video" and want_h:
+        chosen = min(fmts, key=lambda f: abs((f.height or 0) - want_h))
+    else:
+        chosen = fmts[0]                 # ya vienen ordenados: el mejor primero
+
+    direct_url = chosen.url
+    out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
+    ua = getattr(_resolver, "BROWSER_UA", "Mozilla/5.0")
+
+    def action(opts):
+        o = dict(opts)
+        o["outtmpl"] = out_template
+        o["merge_output_format"] = "mp4"
+        o["windowsfilenames"] = True
+        # Algunos CDN (fbcdn) exigen Referer del sitio original; lo pasamos.
+        o["http_headers"] = {"User-Agent": ua, "Referer": url}
+        with yt_dlp.YoutubeDL(o) as ydl:
+            di = ydl.extract_info(direct_url, download=True)
+            reqd = di.get("requested_downloads") or []
+            filepath = reqd[-1].get("filepath") if reqd else ydl.prepare_filename(di)
+        # Enriquecer con la metadata del resolver (yt-dlp sobre URL pelada no la tiene).
+        di = dict(di or {})
+        di["title"] = res.title or di.get("title")
+        di["thumbnail"] = res.thumbnail or di.get("thumbnail")
+        di["uploader"] = res.uploader or di.get("uploader")
+        if chosen.height:
+            di["height"] = chosen.height
+        return di, filepath
+
+    with _DL_SEMAPHORE:
+        return action(_base_opts(None))
+
+
 def _do_download(job_id: str, url: str, format_id: str):
     """Descarga real con yt-dlp, bajo el semaforo y via la cascada."""
+    if format_id.startswith("cauce-") and _resolver is not None:
+        return _do_download_resolved(job_id, url, format_id)
     out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
 
     def action(opts):
@@ -588,7 +700,11 @@ def _download_worker(job: dict):
         # Notificacion tipo "tarjeta de medios": titulo limpio + subtitulo
         # elegante (Autor · Calidad · destino) + miniatura grande + icono.
         media_title = job.get("title") or "Tu descarga"
-        is_audio = "+" not in (job.get("format_id") or "")   # video = "ID+bestaudio"
+        fid = job.get("format_id") or ""
+        if fid.startswith("cauce-"):
+            is_audio = fid.startswith("cauce-a")     # formato del resolver
+        else:
+            is_audio = "+" not in fid                # yt-dlp: video = "ID+bestaudio"
         bits = []
         uploader = info.get("uploader") or info.get("channel")
         if uploader:
@@ -610,6 +726,55 @@ def _download_worker(job: dict):
         _upsert_job(job)
         _notify(job_id, "No se pudo descargar", (fe.get("error") or str(e))[:120],
                 icon="error_outline")
+
+
+def _curate_resolver(info: dict) -> dict:
+    """Cura la salida del resolver estructural al MISMO esquema que list_formats
+    (title/uploader/thumbnail/formats[{format_id,kind,label,filesize_mb}]) para
+    que Claude y la PWA no noten diferencia. Los formatos del resolver son
+    MUXED: se etiquetan por altura y NO llevan `+bestaudio`. El tamano se estima
+    con tbr*duracion cuando ambos se conocen. Los format_id llevan el prefijo
+    `cauce-v-<altura>` / `cauce-a-<idx>` para que download() sepa re-resolver."""
+    duration = info.get("duration")
+    vids: list = []
+    auds: list = []
+    seen_h = set()
+    for f in info.get("formats", []) or []:
+        muxed = f.get("_cauce_muxed", True)
+        h = f.get("height") or 0
+        tbr = f.get("tbr")
+        size_mb = round(tbr * 1000 / 8 * duration / 1_000_000, 1) if (tbr and duration) else 0
+        if muxed:
+            if h in seen_h:
+                continue
+            seen_h.add(h)
+            vids.append((h, {
+                "format_id": f"cauce-v-{h}",
+                "kind": "video",
+                "label": (f"{h}p (mp4)" if h else "Video (mp4)"),
+                "filesize_mb": size_mb,
+            }))
+        else:
+            auds.append({
+                "format_id": f"cauce-a-{len(auds)}",
+                "kind": "audio",
+                "label": f"Audio ({f.get('ext') or 'm4a'})",
+                "filesize_mb": size_mb,
+            })
+    vids.sort(key=lambda t: -t[0])                 # mayor resolucion primero
+    curated = [v for _, v in vids] + auds
+    return {
+        "ok": True,
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "thumbnail": info.get("thumbnail"),
+        "duration_seconds": duration,
+        "formats": curated,
+        "js_engine": "deno" if DENO_PATH else "none",
+        "resolver": True,
+        "confidence": info.get("_cauce_confidence"),
+        "strategy": info.get("_cauce_strategy"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -635,6 +800,11 @@ def list_formats(url: str) -> dict:
         info = _extract_info(url)
     except Exception as e:
         return _friendly_error(e)
+
+    # Si el resultado vino del resolver estructural, se cura aparte: sus
+    # formatos ya son MUXED (video+audio juntos) -> NO se les agrega +bestaudio.
+    if info.get("_cauce_resolver"):
+        return _curate_resolver(info)
 
     raw_formats = info.get("formats", []) or []
     curated = []
@@ -742,6 +912,88 @@ def download_status(job_id: str = "") -> dict:
 
 
 @mcp.tool()
+def resolve_media(url: str) -> dict:
+    """
+    Resuelve un enlace con el MOTOR ESTRUCTURAL (grafo + scoring del HTML), sin
+    depender del extractor de yt-dlp. Util para LinkedIn, Facebook y sitios sin
+    extractor, o para ver POR QUE se eligio cada URL (diagnostico transparente).
+
+    Devuelve titulo, autor, miniatura, la lista de formatos encontrados (con su
+    puntaje y de que parte del HTML salio cada uno) y una confianza 0..1. Los
+    `format_id` que devuelve se pueden pasar directo a `download`.
+
+    Args:
+        url: el enlace a inspeccionar (post/reel/video).
+    """
+    if _resolver is None:
+        return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
+    try:
+        res = _resolver.resolve(url)
+    except Exception as e:
+        return {"ok": False, "error": f"Fallo el resolver: {e}"}
+    return {
+        "ok": res.ok,
+        "title": res.title,
+        "uploader": res.uploader,
+        "thumbnail": res.thumbnail,
+        "duration_seconds": res.duration,
+        "confidence": res.confidence,
+        "strategy": res.strategy,
+        "formats": [{
+            "format_id": (f"cauce-a-0" if f.kind == "audio" else f"cauce-v-{f.height or 0}"),
+            "kind": f.kind,
+            "height": f.height,
+            "score": f.score,
+            "url_preview": f.url[:90],
+            "from": f.provenance,
+        } for f in res.formats],
+        "reason": res.reason,
+        "diagnostics": res.diagnostics,
+    }
+
+
+@mcp.tool()
+def preview_thumbnail(url: str):
+    """
+    Baja la MINIATURA de un enlace y la devuelve como IMAGEN incrustada para que
+    Claude pueda VERLA y analizarla (de que trata, colores, texto en pantalla).
+
+    Funciona porque este server corre en tu telefono (IP residencial) y SI puede
+    llegar al CDN de Facebook/LinkedIn/etc., que la red de Claude tiene vetado.
+    Resuelve el problema de "solo me llega el link de la miniatura, no la imagen".
+
+    Args:
+        url: el enlace del video/reel/post.
+    """
+    thumb = None
+    try:
+        info = _extract_info(url)
+        thumb = info.get("thumbnail")
+    except Exception:
+        pass
+    if not thumb and _resolver is not None:
+        try:
+            thumb = _resolver.resolve(url).thumbnail
+        except Exception:
+            pass
+    if not thumb:
+        return {"ok": False, "error": "No encontre miniatura para ese enlace."}
+    if _resolver is None:
+        return {"ok": True, "thumbnail_url": thumb,
+                "note": "No puedo bajar la imagen en este server; te paso la URL."}
+    got = _resolver.fetch_thumbnail_bytes(thumb, referer=url)
+    if not got:
+        return {"ok": False, "thumbnail_url": thumb,
+                "error": "Tengo la URL de la miniatura pero no pude bajar los bytes."}
+    data, ctype = got
+    if Image is None:
+        return {"ok": True, "thumbnail_url": thumb,
+                "note": "Esta version no puede incrustar imagenes; te paso la URL."}
+    fmt = "png" if "png" in (ctype or "").lower() else "jpeg"
+    return Image(data=data, format=fmt)
+
+
+@mcp.tool()
 def health_check() -> dict:
     """Prueba rapida de que yt-dlp sigue funcionando (via la cascada)."""
     try:
@@ -755,6 +1007,8 @@ def health_check() -> dict:
             "notifications": bool(_TERMUX_NOTIFY),
             "media_scan": bool(_TERMUX_MEDIA_SCAN),
             "po_token": _pot_provider_reachable(),
+            "resolver": _resolver is not None,
+            "resolver_ok": bool(_resolver and _resolver.selftest()),
             "youtube_strategy": _CHAMPION["name"],
             "max_height": _max_height(info),
             "download_dir": str(DOWNLOAD_DIR),
@@ -766,6 +1020,8 @@ def health_check() -> dict:
                 "notifications": bool(_TERMUX_NOTIFY),
                 "media_scan": bool(_TERMUX_MEDIA_SCAN),
                 "po_token": _pot_provider_reachable(),
+                "resolver": _resolver is not None,
+                "resolver_ok": bool(_resolver and _resolver.selftest()),
                 "youtube_strategy": _CHAMPION["name"], **_friendly_error(e)}
 
 
@@ -784,6 +1040,8 @@ async def api_health(request):
         "notifications": bool(_TERMUX_NOTIFY),
         "media_scan": bool(_TERMUX_MEDIA_SCAN),
         "po_token": _pot_provider_reachable(),
+        "resolver": _resolver is not None,
+        "resolver_ok": bool(_resolver and _resolver.selftest()),
         "youtube_strategy": _CHAMPION["name"],
     }, headers=CORS_HEADERS)
 

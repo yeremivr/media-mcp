@@ -259,33 +259,42 @@ def _is_youtube(url: str) -> bool:
     return "youtube.com" in u or "youtu.be" in u or "youtube-nocookie.com" in u
 
 
-# Estrategias en orden de preferencia (APRENDIDO EN VIVO desde IP movil):
-# el cliente por defecto de yt-dlp da formatos completos hasta 1080p60. Los
-# clientes 'tv' y 'web_safari' a veces caen en un experimento DRM de YouTube
-# que solo devuelve miniaturas (issue yt-dlp #12563) -> por eso NO se lidera
-# con ellos y ademas se detecta el caso "solo imagenes" para saltar de cliente.
-# Anadir PO Token luego es trivial (plugin bgutil + una estrategia aqui).
+# Estrategias de 'player_client' que probamos para YouTube. Distintos clientes
+# exponen distintos formatos: cuando YouTube limita la sesion (SABR / falta de
+# PO Token) el cliente 'web' suele quedarse solo con el 360p progresivo (itag
+# 18), pero 'tv'/'ios'/'mweb' muchas veces AUN entregan los DASH de 1080p+. Por
+# eso _extract_info recorre varios y se queda con la MAYOR resolucion (no con el
+# primero que responda). 'tv' a veces cae en el experimento DRM "solo
+# miniaturas" (yt-dlp #12563) -> _has_real_formats lo detecta y lo descarta.
+# Anadir PO Token (plugin bgutil) seria una estrategia mas aqui si hiciera falta.
 YOUTUBE_STRATEGIES = [
-    {"name": "default", "player_client": None,             "use_cookies": False},
-    {"name": "mweb",    "player_client": ["mweb"],         "use_cookies": False},
-    {"name": "web",     "player_client": ["web"],          "use_cookies": False},
+    {"name": "default", "player_client": None,               "use_cookies": False},
+    {"name": "tv",      "player_client": ["tv"],             "use_cookies": False},
+    {"name": "ios",     "player_client": ["ios"],            "use_cookies": False},
+    {"name": "mweb",    "player_client": ["mweb"],           "use_cookies": False},
+    {"name": "web",     "player_client": ["web"],            "use_cookies": False},
     {"name": "web_tv_cookies", "player_client": ["web", "tv"], "use_cookies": True},
 ]
 
-# Auto-aprendizaje: la ultima estrategia que funciono se prueba PRIMERO la
-# proxima vez -> en regimen normal, 1 solo intento aunque YouTube cambie.
+# Auto-aprendizaje: la ultima estrategia que gano se prueba PRIMERO la proxima
+# vez -> en regimen normal, pocas llamadas aunque YouTube cambie.
 _CHAMPION = {"name": None}
 
-# Cache por-URL en la sesion: lo que list_formats descubrio lo reusa download.
+# Cache por-URL en la sesion: la estrategia ganadora de list_formats la reusa
+# download (para pedir el mismo format_id al mismo cliente).
 _URL_STRATEGY: dict = {}
 
 # El telefono tiene recursos limitados: no dejar que descargas pesadas se
 # peleen la CPU/red a la vez. Semaforo simple (2 en paralelo, configurable).
 _DL_SEMAPHORE = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_DL", "2")))
 
+# Altura "suficientemente buena": si un cliente ya da >= esto, dejamos de
+# probar mas clientes (evita latencia en el caso normal).
+GOOD_ENOUGH_HEIGHT = int(os.environ.get("GOOD_ENOUGH_HEIGHT", "720"))
+
 
 def _ordered_strategies() -> list:
-    """Estrategias con la 'campeona' (ultima que funciono) al frente."""
+    """Estrategias con la 'campeona' (ultima que gano) al frente."""
     champ = _CHAMPION["name"]
     if not champ:
         return list(YOUTUBE_STRATEGIES)
@@ -408,17 +417,61 @@ def _has_real_formats(info: dict) -> bool:
     return False
 
 
+def _max_height(info: dict) -> int:
+    """Mayor altura (resolucion) de video disponible en el resultado; 0 si no
+    hay formatos de video. Sirve para comparar que cliente da mejor calidad."""
+    heights = [f.get("height") or 0 for f in (info.get("formats") or [])
+               if f.get("vcodec") not in (None, "none")]
+    return max(heights) if heights else 0
+
+
+def _extract_once(url: str, strategy: dict | None) -> dict:
+    """Una extraccion (sin descargar) con una estrategia concreta. Si YouTube
+    devuelve solo miniaturas (experimento DRM), lo tratamos como fallo para que
+    el caller pruebe el siguiente cliente."""
+    o = _base_opts(strategy)
+    o["skip_download"] = True
+    with yt_dlp.YoutubeDL(o) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if _is_youtube(url) and not _has_real_formats(info):
+        raise RuntimeError("only images are available (DRM/storyboard)")
+    return info
+
+
 def _extract_info(url: str) -> dict:
-    def action(opts):
-        o = dict(opts)
-        o["skip_download"] = True
-        with yt_dlp.YoutubeDL(o) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if _is_youtube(url) and not _has_real_formats(info):
-            # Extrajo OK pero solo miniaturas (DRM) -> forzar siguiente estrategia.
-            raise RuntimeError("only images are available (DRM/storyboard)")
-        return info
-    return _run_resilient(url, action, remember_for_url=True)
+    """Extrae metadata + formatos.
+
+    - Otras plataformas (TikTok/IG/etc.): una sola extraccion.
+    - YouTube: prueba varias estrategias de 'player_client' y SE QUEDA CON LA
+      DE MAYOR RESOLUCION, no con la primera que devuelva algo. Motivo: cuando
+      YouTube limita la sesion (SABR / falta de PO Token) algunos clientes solo
+      entregan el 360p progresivo (itag 18) aunque el video tenga 1080p+. Al
+      recorrer clientes (default/tv/ios/mweb/web) y comparar la altura maxima,
+      recuperamos la calidad alta si ALGUN cliente aun la sirve. Corta apenas
+      encuentra >= GOOD_ENOUGH_HEIGHT (rapido en el caso normal) y recuerda la
+      estrategia ganadora para que la descarga use ese mismo cliente."""
+    if not _is_youtube(url):
+        return _extract_once(url, None)
+
+    best, best_h, last_err = None, -1, None
+    for st in _ordered_strategies():
+        try:
+            info = _extract_once(url, st)
+        except Exception as e:
+            if _classify_error(e) == "hard":
+                raise
+            last_err = e
+            continue
+        h = _max_height(info)
+        if h > best_h:
+            best, best_h = info, h
+            _CHAMPION["name"] = st["name"]
+            _URL_STRATEGY[url] = st
+        if best_h >= GOOD_ENOUGH_HEIGHT:
+            break
+    if best is None:
+        raise last_err if last_err else RuntimeError("YouTube: ninguna estrategia funciono")
+    return best
 
 
 def _load_jobs() -> list:
@@ -538,8 +591,14 @@ def _download_worker(job: dict):
 @mcp.tool()
 def list_formats(url: str) -> dict:
     """
-    Consulta un link (TikTok, Instagram, YouTube, Facebook, etc.) y devuelve
-    metadata (titulo, autor, miniatura, duracion) + formatos disponibles.
+    Muestra los formatos y calidades disponibles de un link de video/audio.
+
+    USA ESTA HERRAMIENTA siempre que el usuario comparta un ENLACE (URL) de
+    YouTube, TikTok, Instagram, Facebook, Twitter/X, etc. y quiera verlo,
+    guardarlo o descargarlo, o pida ver las calidades/formatos o la miniatura.
+    Devuelve titulo, autor, miniatura, duracion y la lista de formatos con su
+    `format_id` (para pasarselo luego a `download`). Para YouTube elige el
+    cliente que da la MAYOR resolucion disponible.
 
     Args:
         url: el link compartido por el usuario.
@@ -594,13 +653,18 @@ def list_formats(url: str) -> dict:
 @mcp.tool()
 def download(url: str, format_id: str) -> dict:
     """
-    Dispara la descarga del link en el format_id elegido. La descarga corre en
-    SEGUNDO PLANO: si termina rapido responde "listo"; si tarda, responde que
-    sigue en background y al terminar salta una notificacion en el telefono.
+    Descarga el link en el format_id elegido (viene de `list_formats`).
+
+    USA ESTA HERRAMIENTA cuando el usuario quiera efectivamente descargar o
+    guardar el video/audio de un enlace. Normalmente se llama DESPUES de
+    `list_formats` (para tener el format_id de la calidad deseada, p.ej. la mas
+    alta). La descarga corre en SEGUNDO PLANO en el telefono: si termina rapido
+    responde "listo"; si tarda, sigue en background y al terminar salta una
+    notificacion nativa con la miniatura y se guarda en la galeria.
 
     Args:
         url: el link original.
-        format_id: el format_id devuelto por list_formats.
+        format_id: el format_id devuelto por list_formats (ej. la mejor calidad).
     """
     job_id = str(uuid.uuid4())[:8]
     job = {
@@ -663,6 +727,7 @@ def health_check() -> dict:
             "notifications": bool(_TERMUX_NOTIFY),
             "media_scan": bool(_TERMUX_MEDIA_SCAN),
             "youtube_strategy": _CHAMPION["name"],
+            "max_height": _max_height(info),
             "download_dir": str(DOWNLOAD_DIR),
             "title": info.get("title"),
         }

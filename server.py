@@ -206,13 +206,17 @@ def _is_youtube(url: str) -> bool:
     return "youtube.com" in u or "youtu.be" in u or "youtube-nocookie.com" in u
 
 
-# Estrategias en orden de preferencia. Anadir PO Token luego es trivial
-# (instalar el plugin bgutil y, si se quiere, sumar una estrategia aqui).
+# Estrategias en orden de preferencia (APRENDIDO EN VIVO desde IP movil):
+# el cliente por defecto de yt-dlp da formatos completos hasta 1080p60. Los
+# clientes 'tv' y 'web_safari' a veces caen en un experimento DRM de YouTube
+# que solo devuelve miniaturas (issue yt-dlp #12563) -> por eso NO se lidera
+# con ellos y ademas se detecta el caso "solo imagenes" para saltar de cliente.
+# Anadir PO Token luego es trivial (plugin bgutil + una estrategia aqui).
 YOUTUBE_STRATEGIES = [
-    {"name": "tv",          "player_client": ["tv"],         "use_cookies": False},
-    {"name": "web_safari",  "player_client": ["web_safari"], "use_cookies": False},
-    {"name": "mweb",        "player_client": ["mweb"],       "use_cookies": False},
-    {"name": "web_cookies", "player_client": ["web"],        "use_cookies": True},
+    {"name": "default", "player_client": None,             "use_cookies": False},
+    {"name": "mweb",    "player_client": ["mweb"],         "use_cookies": False},
+    {"name": "web",     "player_client": ["web"],          "use_cookies": False},
+    {"name": "web_tv_cookies", "player_client": ["web", "tv"], "use_cookies": True},
 ]
 
 # Auto-aprendizaje: la ultima estrategia que funciono se prueba PRIMERO la
@@ -341,13 +345,32 @@ def _friendly_error(e: Exception) -> dict:
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
 
 
+def _has_real_formats(info: dict) -> bool:
+    """True si hay al menos un formato de video o audio REAL (no storyboard).
+    YouTube a veces (experimento DRM en 'tv'/'web_safari') solo devuelve
+    miniaturas; eso lo tratamos como fallo para probar el siguiente cliente."""
+    for f in (info.get("formats") or []):
+        if f.get("vcodec") not in (None, "none") or f.get("acodec") not in (None, "none"):
+            return True
+    return False
+
+
 def _extract_info(url: str) -> dict:
     def action(opts):
         o = dict(opts)
         o["skip_download"] = True
         with yt_dlp.YoutubeDL(o) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
+        if _is_youtube(url) and not _has_real_formats(info):
+            # Extrajo OK pero solo miniaturas (DRM) -> forzar siguiente estrategia.
+            raise RuntimeError("only images are available (DRM/storyboard)")
+        return info
     return _run_resilient(url, action, remember_for_url=True)
+
+
+def _load_jobs() -> list:
+    with _JOBS_LOCK:
+        return _read_jobs_unlocked()
 
 
 # ---- Registro de jobs (con lock: varios hilos escriben el mismo JSON) ----
@@ -366,11 +389,6 @@ def _read_jobs_unlocked() -> list:
         except Exception:
             return []
     return []
-
-
-def _load_jobs() -> list:
-    with _JOBS_LOCK:
-        return _read_jobs_unlocked()
 
 
 def _upsert_job(job: dict):

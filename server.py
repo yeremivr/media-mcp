@@ -45,6 +45,7 @@ import asyncio
 import shutil
 import threading
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import yt_dlp
@@ -176,10 +177,15 @@ _TERMUX_OPEN = shutil.which("termux-open")
 # MediaStore para que aparezca en la Galeria/reproductor (ver _media_scan).
 _TERMUX_MEDIA_SCAN = shutil.which("termux-media-scan")
 
+# Cache PRIVADA para las miniaturas de las notificaciones. Va en el home de
+# Termux (NO en el almacenamiento compartido) para no ensuciar la galeria.
+_THUMB_CACHE = Path(os.path.expanduser("~/.cache/cauce_thumbs"))
 
-def _notify(job_id: str, title: str, body: str, filepath: str | None = None):
-    """Lanza una notificacion de Android. Nunca debe tumbar la descarga:
-    si falla o no hay Termux, simplemente no hace nada."""
+
+def _notify(job_id: str, title: str, body: str, filepath: str | None = None,
+            image_path: str | None = None, icon: str | None = None):
+    """Lanza una notificacion de Android tipo 'tarjeta de medios'. Nunca debe
+    tumbar la descarga: si falla o no hay Termux, simplemente no hace nada."""
     if not _TERMUX_NOTIFY:
         return
     try:
@@ -189,11 +195,15 @@ def _notify(job_id: str, title: str, body: str, filepath: str | None = None):
                "--priority", "high",
                "--title", title,
                "--content", body]              # obligatorio: si no, espera stdin 3s
+        if icon:
+            cmd += ["--icon", icon]             # icono de estado (Material, snake_case)
+        if image_path and os.path.exists(image_path):
+            cmd += ["--image-path", str(image_path)]   # miniatura grande (BigPicture)
         if filepath and _TERMUX_OPEN:
             # `--action` se ejecuta con dash -c: ruta ABSOLUTA de termux-open
             # + path con comillas seguras (anti-inyeccion via el titulo).
             cmd += ["--action", f"{_TERMUX_OPEN} {shlex.quote(str(filepath))}"]
-        subprocess.run(cmd, timeout=15, check=False,
+        subprocess.run(cmd, timeout=20, check=False,
                        stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -218,6 +228,26 @@ def _media_scan(filepath: str | None):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
+
+def _fetch_thumb(url: str | None, job_id: str) -> str | None:
+    """Descarga la miniatura del video/cancion a la cache PRIVADA y devuelve
+    su ruta local, para adjuntarla como imagen grande en la notificacion.
+    Best-effort: si falla, devuelve None y la notificacion sale sin imagen."""
+    if not url:
+        return None
+    try:
+        _THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+        dst = _THUMB_CACHE / f"{job_id}.jpg"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = r.read()
+        if not data:
+            return None
+        dst.write_bytes(data)
+        return str(dst)
+    except Exception:
+        return None
 
 
 # ==========================================================================
@@ -473,14 +503,32 @@ def _download_worker(job: dict):
         # Registrar en el MediaStore ANTES de notificar: asi, al tocar la
         # notificacion, el video ya es visible en la Galeria/reproductor.
         _media_scan(filepath)
-        body = ("Guardado en tu galeria (Descargas/Cauce)." if in_gallery
-                else "Descarga lista.")
-        _notify(job_id, f"✅ {job.get('title') or 'Video'}", body, filepath=filepath)
+
+        # Notificacion tipo "tarjeta de medios": titulo limpio + subtitulo
+        # elegante (Autor · Calidad · destino) + miniatura grande + icono.
+        media_title = job.get("title") or "Tu descarga"
+        is_audio = "+" not in (job.get("format_id") or "")   # video = "ID+bestaudio"
+        bits = []
+        uploader = info.get("uploader") or info.get("channel")
+        if uploader:
+            bits.append(uploader)
+        if is_audio:
+            bits.append("Audio")
+        elif info.get("height"):
+            bits.append(f"{info.get('height')}p")
+        bits.append("Guardado en tu galería" if in_gallery else "Descarga lista")
+        subtitle = "  ·  ".join(bits)
+
+        thumb = _fetch_thumb(info.get("thumbnail"), job_id)
+        icon = "music_note" if is_audio else "movie"
+        _notify(job_id, media_title, subtitle, filepath=filepath,
+                image_path=thumb, icon=icon)
     except Exception as e:
         fe = _friendly_error(e)
         job.update({"status": "error", "error": fe.get("error", str(e)), "updated_at": _now()})
         _upsert_job(job)
-        _notify(job_id, "❌ No se pudo descargar", (fe.get("error") or str(e))[:120])
+        _notify(job_id, "No se pudo descargar", (fe.get("error") or str(e))[:120],
+                icon="error_outline")
 
 
 # --------------------------------------------------------------------------

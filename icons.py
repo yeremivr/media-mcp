@@ -1,11 +1,85 @@
-"""Iconos de la PWA Cauce embebidos en base64 (PNG).
+"""Iconos de la PWA Cauce generados por codigo (no incrustados como binario).
 
-El commit de binarios via la API de GitHub corrompe los archivos, asi que
-los iconos se guardan aqui como texto y server.py los decodifica y sirve en
-/icon-192.png y /icon-512.png. Asi el repo queda 100% en texto y reproducible.
-Motivo grafico: tres olas teal = 'cauce' que fluye (mismo logo de la app).
+server.py importa ICON_192_B64 / ICON_512_B64 y los sirve en /icon-192.png y
+/icon-512.png. Se generan aqui con Pillow en vez de hardcodear un PNG porque:
+  1) el commit de binarios/base64 largo via la API de GitHub es fragil
+     (un solo caracter cambiado corrompe el PNG);
+  2) es mas elegante y reproducible: el icono es matematica vectorial, no un
+     asset opaco. Motivo grafico: tres olas teal = 'cauce' que fluye.
 """
 
-ICON_192_B64 = "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"
+import io
+import math
+import base64
+from functools import lru_cache
 
-ICON_512_B64 = "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"
+from PIL import Image, ImageDraw, ImageFilter
+
+BG = (11, 14, 20)         # #0B0E14 fondo
+BG2 = (18, 24, 34)        # leve degradado
+FLOW = (61, 214, 196)     # #3DD6C4 teal claro
+FLOW_DEEP = (31, 166, 151)  # #1FA697 teal profundo
+
+
+def _lerp(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+@lru_cache(maxsize=4)
+def render_icon(size: int) -> bytes:
+    """Bytes PNG del icono al tamano pedido (fondo a sangre completa = maskable)."""
+    SS = 4  # supersampling para bordes suaves
+    S = size * SS
+    img = Image.new("RGB", (S, S), BG)
+
+    # Degradado vertical sutil del fondo.
+    top = Image.new("RGB", (S, S), BG2)
+    mask = Image.new("L", (S, S))
+    md = ImageDraw.Draw(mask)
+    for y in range(S):
+        md.line([(0, y), (S, y)], fill=int(90 * (1 - y / S)))
+    img = Image.composite(top, img, mask)
+
+    # Glow teal detras de las olas.
+    glow = Image.new("RGB", (S, S), BG)
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([S * 0.18, S * 0.34, S * 0.82, S * 0.66], fill=_lerp(BG, FLOW_DEEP, 0.35))
+    glow = glow.filter(ImageFilter.GaussianBlur(S * 0.14))
+    img = Image.blend(img, glow, 0.18)
+
+    # Tres olas como bandas rellenas (bordes limpios, grosor uniforme).
+    draw = ImageDraw.Draw(img)
+    x0, x1 = S * 0.20, S * 0.80
+    half = S * 0.028
+    amp = S * 0.052
+    wl = x1 - x0
+    steps = 260
+    for idx, cyf in enumerate((0.40, 0.50, 0.60)):
+        cy = S * cyf
+        color = _lerp(FLOW, FLOW_DEEP, idx / 2)
+        top_pts, bot_pts = [], []
+        for i in range(steps + 1):
+            x = x0 + wl * i / steps
+            ph = (x - x0) / wl * 2 * math.pi * 1.5 + idx * 0.9
+            y = cy + amp * math.sin(ph)
+            dydx = amp * math.cos(ph) * (2 * math.pi * 1.5 / wl)
+            nlen = math.hypot(1.0, dydx)
+            nx, ny = -dydx / nlen, 1.0 / nlen
+            top_pts.append((x + nx * half, y + ny * half))
+            bot_pts.append((x - nx * half, y - ny * half))
+        draw.polygon(top_pts + bot_pts[::-1], fill=color)
+        # Puntas redondeadas en los extremos.
+        yb = cy + amp * math.sin(idx * 0.9)
+        ye = cy + amp * math.sin(2 * math.pi * 1.5 + idx * 0.9)
+        draw.ellipse([x0 - half, yb - half, x0 + half, yb + half], fill=color)
+        draw.ellipse([x1 - half, ye - half, x1 + half, ye + half], fill=color)
+
+    img = img.resize((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# server.py consume estas constantes (base64 de los PNG ya renderizados).
+ICON_192_B64 = base64.b64encode(render_icon(192)).decode()
+ICON_512_B64 = base64.b64encode(render_icon(512)).decode()

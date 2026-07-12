@@ -73,8 +73,8 @@ if DENO_PATH:
     os.environ["PATH"] = os.path.dirname(DENO_PATH) + os.pathsep + os.environ.get("PATH", "")
 
 
-def _find_cookies() -> str | None:
-    """Cookies opcionales para YouTube.
+def _find_cookies_source() -> str | None:
+    """Ubicacion del cookies.txt para YouTube.
 
     Desde IPs de datacenter (como Render) YouTube responde a algunos videos con
     'Sign in to confirm you're not a bot'. Eso SOLO se resuelve con cookies de
@@ -92,7 +92,27 @@ def _find_cookies() -> str | None:
     return None
 
 
-COOKIES_FILE = _find_cookies()
+def _prepare_cookies() -> str | None:
+    """Devuelve un cookies.txt ESCRIBIBLE.
+
+    yt-dlp reescribe el cookiefile al terminar cada extraccion. Si apunta a un
+    Secret File de Render (montado en /etc/secrets, solo lectura) revienta con
+    'Read-only file system' y rompe TODAS las descargas. Por eso copiamos el
+    archivo a una ruta escribible al arrancar y usamos esa copia.
+    """
+    src = _find_cookies_source()
+    if not src:
+        return None
+    try:
+        dst = DOWNLOAD_DIR / "cookies_active.txt"
+        shutil.copyfile(src, dst)
+        return str(dst)
+    except Exception:
+        # Si no se pudo copiar, es mejor no usar cookies que tumbar el servidor.
+        return None
+
+
+COOKIES_FILE = _prepare_cookies()
 
 
 def _base_opts() -> dict:

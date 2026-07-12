@@ -1,13 +1,18 @@
 """
-media-mcp: servidor MCP remoto que envuelve yt-dlp + API web para la PWA.
+media-mcp: servidor MCP remoto que envuelve yt-dlp + API web para la PWA "Cauce".
 
-Herramientas MCP para Claude:
+Herramientas MCP para Claude (capa de razonamiento):
   - list_formats(url): metadata + formatos (rapido, no descarga)
   - download(url, format_id): descarga y registra el job
   - health_check(): estado de yt-dlp
 
-API web para la PWA:
-  - GET /api/jobs, /api/file/{job_id}, /api/health
+API web para la PWA (capa 'ultimo kilometro', mismo origen que el servidor):
+  - GET /                    -> la PWA Cauce (archivos estaticos de ./pwa)
+  - GET /api/health          -> estado del servidor
+  - GET /api/jobs            -> lista de descargas listas
+  - GET /api/file/{job_id}   -> entrega el archivo al telefono
+
+El endpoint MCP para Claude queda en  /mcp
 """
 
 import os
@@ -19,22 +24,35 @@ from pathlib import Path
 
 import yt_dlp
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse, FileResponse
 
 from auto_updater import run_forever as run_auto_updater
 
-DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_INDEX = DOWNLOAD_DIR / "_jobs.json"
+PWA_DIR = BASE_DIR / "pwa"
 
 PORT = int(os.environ.get("PORT", 8000))
+
+# CORS: permite que la PWA lea el API aunque se sirva desde otro origen
+# (ej. GitHub Pages). Si se sirve desde el mismo servidor, no estorba.
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
 
 
 def _find_deno() -> str | None:
     """Busca el ejecutable de Deno (motor JS que yt-dlp usa para YouTube)."""
     candidates = [
         shutil.which("deno"),
+        str(BASE_DIR / ".deno" / "bin" / "deno"),
         os.path.expanduser("~/.deno/bin/deno"),
         "/opt/render/.deno/bin/deno",
+        "/opt/render/project/src/.deno/bin/deno",
     ]
     for c in candidates:
         if c and os.path.exists(c):
@@ -44,17 +62,13 @@ def _find_deno() -> str | None:
 
 DENO_PATH = _find_deno()
 if DENO_PATH:
-    # Asegura que yt-dlp encuentre Deno anadiendolo al PATH.
+    # Con Deno en el PATH, yt-dlp lo detecta y lo usa solo para YouTube.
     os.environ["PATH"] = os.path.dirname(DENO_PATH) + os.pathsep + os.environ.get("PATH", "")
 
 
 def _base_opts() -> dict:
-    """Opciones base de yt-dlp, con motor JS para YouTube si Deno existe."""
-    opts = {"quiet": True, "no_warnings": True}
-    if DENO_PATH:
-        # yt-dlp 2026+ usa 'js_runtimes' para resolver los retos de YouTube.
-        opts["extractor_args"] = {"youtube": {"js_runtime": ["deno"]}}
-    return opts
+    """Opciones base de yt-dlp. Deno (si existe) se detecta solo via PATH."""
+    return {"quiet": True, "no_warnings": True}
 
 
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
@@ -67,17 +81,25 @@ def _extract_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def _record_job(job: dict):
-    jobs = []
+def _load_jobs() -> list:
     if JOBS_INDEX.exists():
         try:
-            jobs = json.loads(JOBS_INDEX.read_text())
+            return json.loads(JOBS_INDEX.read_text())
         except Exception:
-            jobs = []
+            return []
+    return []
+
+
+def _record_job(job: dict):
+    jobs = _load_jobs()
     jobs.insert(0, job)
     jobs = jobs[:50]
     JOBS_INDEX.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
 
+
+# --------------------------------------------------------------------------
+# Herramientas MCP (capa de razonamiento: las llama Claude)
+# --------------------------------------------------------------------------
 
 @mcp.tool()
 def list_formats(url: str) -> dict:
@@ -189,7 +211,59 @@ def health_check() -> dict:
         return {"ok": False, "js_engine": "deno" if DENO_PATH else "none", "error": str(e)}
 
 
+# --------------------------------------------------------------------------
+# API web (capa 'ultimo kilometro': la consume la PWA Cauce)
+# --------------------------------------------------------------------------
+
+@mcp.custom_route("/api/health", methods=["GET"])
+async def api_health(request):
+    return JSONResponse({
+        "ok": True,
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "js_engine": "deno" if DENO_PATH else "none",
+    }, headers=CORS_HEADERS)
+
+
+@mcp.custom_route("/api/jobs", methods=["GET"])
+async def api_jobs(request):
+    jobs = _load_jobs()
+    # No exponemos file_path (ruta interna del servidor) al cliente.
+    safe = [{k: v for k, v in j.items() if k != "file_path"} for j in jobs]
+    return JSONResponse({"jobs": safe}, headers=CORS_HEADERS)
+
+
+@mcp.custom_route("/api/file/{job_id}", methods=["GET"])
+async def api_file(request):
+    job_id = request.path_params["job_id"]
+    for j in _load_jobs():
+        if j.get("job_id") == job_id:
+            fp = j.get("file_path")
+            if fp and os.path.exists(fp):
+                return FileResponse(fp, filename=os.path.basename(fp), headers=CORS_HEADERS)
+            return JSONResponse(
+                {"ok": False, "error": "El archivo ya no esta en el servidor (se reinicio). Vuelve a pedir la descarga."},
+                status_code=410, headers=CORS_HEADERS,
+            )
+    return JSONResponse({"ok": False, "error": "job no encontrado"}, status_code=404, headers=CORS_HEADERS)
+
+
 if __name__ == "__main__":
     import threading
+    import uvicorn
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+
+    # Auto-updater de yt-dlp en segundo plano (no bloquea al servidor).
     threading.Thread(target=lambda: asyncio.run(run_auto_updater()), daemon=True).start()
-    mcp.run(transport="streamable-http")
+
+    # App ASGI: incluye /mcp (para Claude) y /api/* (custom_route).
+    app = mcp.streamable_http_app()
+
+    # Sirve la PWA Cauce en la raiz. Se agrega al final para que /mcp y /api/*
+    # tengan prioridad; cualquier otra ruta cae en los archivos estaticos.
+    if PWA_DIR.exists():
+        app.router.routes.append(
+            Mount("/", app=StaticFiles(directory=str(PWA_DIR), html=True), name="pwa")
+        )
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

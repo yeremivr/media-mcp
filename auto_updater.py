@@ -28,11 +28,11 @@ def _write_status(ok: bool, detail: str, version: str | None = None):
 
 
 def _update_and_check() -> tuple[bool, str, str | None]:
-    # 1. Intentar actualizar yt-dlp a la última versión
+    # 1. Intentar actualizar yt-dlp[default] (incluye los scripts EJS de YouTube)
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
-            check=True, capture_output=True, timeout=120,
+            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
+            check=True, capture_output=True, timeout=180,
         )
     except Exception as e:
         return False, f"No se pudo actualizar yt-dlp: {e}", None

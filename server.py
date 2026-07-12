@@ -11,6 +11,7 @@ API web para la PWA (capa 'ultimo kilometro', mismo origen que el servidor):
   - GET /api/health          -> estado del servidor
   - GET /api/jobs            -> lista de descargas listas
   - GET /api/file/{job_id}   -> entrega el archivo al telefono
+  - GET /icon-192.png, /icon-512.png -> iconos de la PWA (desde icons.py)
 
 El endpoint MCP para Claude queda en  /mcp
 """
@@ -18,15 +19,21 @@ El endpoint MCP para Claude queda en  /mcp
 import os
 import json
 import uuid
+import base64
 import asyncio
 import shutil
 from pathlib import Path
 
 import yt_dlp
 from mcp.server.fastmcp import FastMCP
-from starlette.responses import JSONResponse, FileResponse
+from starlette.responses import JSONResponse, FileResponse, Response
 
 from auto_updater import run_forever as run_auto_updater
+
+try:
+    from icons import ICON_192_B64, ICON_512_B64
+except Exception:
+    ICON_192_B64 = ICON_512_B64 = ""
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
@@ -247,6 +254,18 @@ async def api_file(request):
     return JSONResponse({"ok": False, "error": "job no encontrado"}, status_code=404, headers=CORS_HEADERS)
 
 
+@mcp.custom_route("/icon-192.png", methods=["GET"])
+async def icon_192(request):
+    return Response(base64.b64decode(ICON_192_B64), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@mcp.custom_route("/icon-512.png", methods=["GET"])
+async def icon_512(request):
+    return Response(base64.b64decode(ICON_512_B64), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 if __name__ == "__main__":
     import threading
     import uvicorn
@@ -256,11 +275,11 @@ if __name__ == "__main__":
     # Auto-updater de yt-dlp en segundo plano (no bloquea al servidor).
     threading.Thread(target=lambda: asyncio.run(run_auto_updater()), daemon=True).start()
 
-    # App ASGI: incluye /mcp (para Claude) y /api/* (custom_route).
+    # App ASGI: incluye /mcp (para Claude) y /api/* + /icon-*.png (custom_route).
     app = mcp.streamable_http_app()
 
-    # Sirve la PWA Cauce en la raiz. Se agrega al final para que /mcp y /api/*
-    # tengan prioridad; cualquier otra ruta cae en los archivos estaticos.
+    # Sirve la PWA Cauce en la raiz. Se agrega al final para que /mcp, /api/* e
+    # /icon-*.png tengan prioridad; cualquier otra ruta cae en los estaticos.
     if PWA_DIR.exists():
         app.router.routes.append(
             Mount("/", app=StaticFiles(directory=str(PWA_DIR), html=True), name="pwa")

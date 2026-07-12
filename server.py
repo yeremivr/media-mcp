@@ -14,6 +14,7 @@ import os
 import json
 import uuid
 import asyncio
+import shutil
 from pathlib import Path
 
 import yt_dlp
@@ -27,11 +28,42 @@ JOBS_INDEX = DOWNLOAD_DIR / "_jobs.json"
 
 PORT = int(os.environ.get("PORT", 8000))
 
+
+def _find_deno() -> str | None:
+    """Busca el ejecutable de Deno (motor JS que yt-dlp usa para YouTube)."""
+    candidates = [
+        shutil.which("deno"),
+        os.path.expanduser("~/.deno/bin/deno"),
+        "/opt/render/.deno/bin/deno",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+DENO_PATH = _find_deno()
+if DENO_PATH:
+    # Asegura que yt-dlp encuentre Deno anadiendolo al PATH.
+    os.environ["PATH"] = os.path.dirname(DENO_PATH) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _base_opts() -> dict:
+    """Opciones base de yt-dlp, con motor JS para YouTube si Deno existe."""
+    opts = {"quiet": True, "no_warnings": True}
+    if DENO_PATH:
+        # yt-dlp 2026+ usa 'js_runtimes' para resolver los retos de YouTube.
+        opts["extractor_args"] = {"youtube": {"js_runtime": ["deno"]}}
+    return opts
+
+
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
 
 
 def _extract_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+    opts = _base_opts()
+    opts["skip_download"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -97,6 +129,7 @@ def list_formats(url: str) -> dict:
         "thumbnail": info.get("thumbnail"),
         "duration_seconds": info.get("duration"),
         "formats": curated,
+        "js_engine": "deno" if DENO_PATH else "none",
     }
 
 
@@ -112,10 +145,12 @@ def download(url: str, format_id: str) -> dict:
     job_id = str(uuid.uuid4())[:8]
     out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
 
-    ydl_opts = {"format": format_id, "outtmpl": out_template, "quiet": True, "no_warnings": True}
+    opts = _base_opts()
+    opts["format"] = format_id
+    opts["outtmpl"] = out_template
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
     except Exception as e:
@@ -144,9 +179,14 @@ def health_check() -> dict:
     """Prueba rapida de que yt-dlp sigue funcionando."""
     try:
         info = _extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        return {"ok": True, "yt_dlp_version": yt_dlp.version.__version__, "title": info.get("title")}
+        return {
+            "ok": True,
+            "yt_dlp_version": yt_dlp.version.__version__,
+            "js_engine": "deno" if DENO_PATH else "none",
+            "title": info.get("title"),
+        }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "js_engine": "deno" if DENO_PATH else "none", "error": str(e)}
 
 
 if __name__ == "__main__":

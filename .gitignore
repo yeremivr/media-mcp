@@ -8,6 +8,10 @@ __pycache__/
 cookies.txt
 cookies_active.txt
 
-# Descargas y logs locales.
+# Descargas y estado de runtime. `downloads/` la crea server.py al importarlo
+# (basta con correr los tests) y dentro van los medios, el indice de jobs
+# `_jobs.json` y las puertas aprendidas `_gates.json`: todo eso es estado de
+# ESTA maquina, no del proyecto.
+downloads/
 descargas/
 *.log

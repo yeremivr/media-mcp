@@ -1016,6 +1016,11 @@ def _path_size(url: str) -> tuple[int | None, int | None]:
     path = parsed.path
     if _FULLSIZE_HINT.search(path):
         return _FULLSIZE_PX, _FULLSIZE_PX
+    # Sufijo de rendition de X/Twitter (.jpg:large, .jpg:orig): son las
+    # versiones GRANDES, y sin esto se quedaban sin tamano conocido y perdian
+    # frente a una variante chica que si lo declaraba en el query.
+    if re.search(r":(?:orig|large)$", path, re.I):
+        return _FULLSIZE_PX, _FULLSIZE_PX
     m = _PATH_SIZE.search(path)
     if not m:
         # Fallback al query (Instagram/Facebook lo esconden en `stp`).
@@ -1073,6 +1078,12 @@ def image_identity(url: str) -> str:
         return f"li:{m.group(1)}"
 
     base = path.rsplit("/", 1)[-1]
+
+    # X/Twitter marca la rendition con un sufijo PEGADO al nombre en vez de un
+    # parametro: HNoYYPpXUAA8b26.jpg:large / :orig / :small. Sin quitarlo, la
+    # misma foto en dos tamanos se cuenta como dos fotos distintas (visto en
+    # vivo: un tuit con 1 imagen devolvia 2).
+    base = re.sub(r":(?:orig|large|medium|small|thumb|\d+x\d+)$", "", base, flags=re.I)
 
     host = (p.hostname or "").lower()
     if re.search(r"(?:fbcdn\.net|cdninstagram\.com)$", host):

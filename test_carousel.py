@@ -578,6 +578,31 @@ def main():
     ok &= check("un caption REAL no se descarta",
                 R.clean_caption("Receta de pan de masa madre con 18 horas de fermentacion"))
 
+    print("\n=== V. X/Twitter: el sufijo :large es rendition, no otra foto ===")
+    # Capturado EN VIVO: un tuit con UNA imagen devolvia dos, porque X marca
+    # el tamano con un sufijo pegado al nombre (.jpg:large) en vez de un
+    # parametro, y el agrupador las tomaba por archivos distintos.
+    X_POST = (
+        '<meta property="og:title" content=\'Marcelo Chepillo on X: "un meme" / X\'>'
+        '<meta property="og:image" content="https://pbs.twimg.com/media/'
+        'HNoYYPpXUAA8b26.jpg:large">'
+        '<img src="https://pbs.twimg.com/media/HNoYYPpXUAA8b26.jpg?name=small'
+        '&format=jpg">'
+    )
+    v = R.resolve_html(X_POST, "https://x.com/JRafela63855/status/2079001071393890584")
+    for c in v.images:
+        print(f"    [{c.score:6.1f}] {c.url}")
+    ok &= check("UNA sola foto (fusiona :large con la variante del query)",
+                len(v.images) == 1)
+    ok &= check("se queda con la version GRANDE (:large)",
+                v.images and ":large" in v.images[0].url)
+    ok &= check("media_type = image, no carousel", v.media_type == "image")
+    ok &= check("identity ignora el sufijo :large",
+                R.image_identity("https://pbs.twimg.com/media/ABC12345.jpg:large")
+                == R.image_identity("https://pbs.twimg.com/media/ABC12345.jpg"))
+    ok &= check("desenvuelve el og:title de X y su cola ' / X'",
+                v.uploader == "Marcelo Chepillo")
+
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())
     ok &= check("selftest_carousel() (fotos) OK", R.selftest_carousel())

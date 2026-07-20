@@ -1,0 +1,13 @@
+# Bytecode: lo genera cualquiera que corra los tests o py_compile. Son
+# BINARIOS y ademas atados a la version de Python (el telefono corre 3.14 y
+# los .pyc de un 3.12 no le sirven de nada).
+__pycache__/
+*.py[cod]
+
+# Cookies de yt-dlp: son CREDENCIALES de sesion. Nunca al repo.
+cookies.txt
+cookies_active.txt
+
+# Descargas y logs locales.
+descargas/
+*.log

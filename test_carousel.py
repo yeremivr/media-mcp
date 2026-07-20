@@ -823,6 +823,45 @@ def main():
                 len(R.keep_authoritative(
                     CINCO, "https://otrositio.com/imagen-sin-relacion.jpg")) == 5)
 
+    print("\n=== V2. la caratula de un video NO es una foto del post ===")
+    # Verdad de campo dada por el usuario: el post /p/DaJIuiznJjV/ tiene
+    # 2 FOTOS y 5 VIDEOS. El motor devolvia "7 fotos" -- el conteo total
+    # acertaba, pero 5 de esas "fotos" eran las caratulas de los videos.
+    # Bajarlas habria dado 5 fotogramas congelados en vez de los videos, y
+    # como un fotograma es un JPEG perfectamente valido, la verificacion de
+    # bytes no podia notarlo. Fallo silencioso de una clase nueva.
+    #
+    # Nada en la URL ni en el tamano delata a una caratula: es un fotograma
+    # del propio video, misma camara y misma escena. Solo la delata la
+    # ESTRUCTURA, y solo si se conserva la POSICION dentro de las listas --
+    # que es justo lo que el DFS tiraba.
+    B = ("xdt_api", "items", "#0", "carousel_media")
+    VID1 = B + ("#1", "video_versions", "#0", "url")
+    POST1 = B + ("#1", "image_versions2", "candidates", "#0", "url")
+    FOTO3 = B + ("#3", "image_versions2", "candidates", "#0", "url")
+
+    ok &= check("un video y SU caratula cuelgan del mismo elemento",
+                R._same_item(VID1, POST1))
+    ok &= check("un video y una foto de OTRO elemento, no",
+                not R._same_item(VID1, FOTO3))
+    ok &= check("dos elementos hermanos tampoco se confunden entre si",
+                not R._same_item(POST1, FOTO3))
+
+    def _pc(p, kind):
+        return R.MediaCandidate(url="https://cdn/" + "/".join(p), score=100,
+                                kind=kind, path=p)
+
+    quedan = R.drop_video_posters([_pc(POST1, "image"), _pc(FOTO3, "image")],
+                                  [_pc(VID1, "video")])
+    ok &= check("se cae la caratula y sobrevive la foto de verdad",
+                len(quedan) == 1 and quedan[0].path == FOTO3)
+    ok &= check("sin videos en el post no se toca ninguna foto",
+                len(R.drop_video_posters(
+                    [_pc(POST1, "image"), _pc(FOTO3, "image")], [])) == 2)
+    ok &= check("candidatos sin rastro de posicion no se descartan por error",
+                len(R.drop_video_posters([_pc((), "image")],
+                                         [_pc(VID1, "video")])) == 1)
+
     print("\n=== X. que lo aprendido SOBREVIVA al reinicio ===")
     # Las memorias de puertas eran dicts en RAM: se vaciaban en cada
     # `reload-cauce.sh`, asi que el sistema desaprendia cada vez que el usuario

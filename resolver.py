@@ -706,6 +706,19 @@ class RawCandidate:
     from_dom: bool = False
     dom_attrs: dict = field(default_factory=dict)
     is_img: bool = False         # vino de <img>/srcset/og:image
+    # Como `ancestors` pero incluyendo la POSICION dentro de cada lista. Un
+    # post no es una bolsa de medios: es una SECUENCIA DE ELEMENTOS, y cada
+    # elemento es o una foto o un video CON SU CARATULA. `ancestors` no
+    # distingue el elemento 3 del 5 —al recorrer una lista no se guardaba el
+    # indice— asi que la caratula de un video y una foto de verdad quedaban
+    # indistinguibles. Por eso un post de 2 fotos + 5 videos se ofrecia como
+    # "7 fotos", y bajarlas habria dado 5 fotogramas congelados en lugar de
+    # los videos: archivos JPEG validos, asi que ni la verificacion de bytes
+    # lo habria notado. Fallo silencioso.
+    # NO se usa para puntuar ni para la procedencia (tocar esos habria movido
+    # el scoring y roto el cohorte): solo para saber que dos candidatos
+    # colgaban del MISMO elemento del carrusel.
+    path: tuple = ()
     # ORDEN DE APARICION en el documento. Para un carrusel el orden IMPORTA
     # (foto 1, 2, 3...) y no coincide con el ranking por puntaje. El DFS
     # visita en orden de documento, asi que este indice ES el orden real.
@@ -724,7 +737,8 @@ def _looks_urlish(v: str) -> bool:
     return "http" in v[:12] and "//" in v
 
 
-def _walk(node, ancestors: tuple, out: list, depth: int = 0, parent: dict | None = None):
+def _walk(node, ancestors: tuple, out: list, depth: int = 0,
+          parent: dict | None = None, path: tuple = ()):
     """DFS que emite un RawCandidate por cada hoja string que parezca URL,
     arrastrando la procedencia estructural (ancestros, hermanas, objeto padre).
 
@@ -744,12 +758,18 @@ def _walk(node, ancestors: tuple, out: list, depth: int = 0, parent: dict | None
                         siblings=sib_keys,
                         sibling_obj=node,
                         depth=depth,
+                        path=path + (str(k),),
                     ))
             else:
-                _walk(v, ancestors + (str(k),), out, depth + 1, node)
+                _walk(v, ancestors + (str(k),), out, depth + 1, node,
+                      path + (str(k),))
     elif isinstance(node, (list, tuple)):
-        for v in node:
-            _walk(v, ancestors, out, depth + 1, parent)
+        # `ancestors` NO recibe el indice a proposito: el scoring y la
+        # procedencia se apoyan en el, y meterle numeros habria movido el
+        # puntaje y roto el cohorte de procedencia. `path` si lo guarda, que
+        # es lo unico que necesitamos para reconstruir los elementos.
+        for i, v in enumerate(node):
+            _walk(v, ancestors, out, depth + 1, parent, path + (f"#{i}",))
 
 
 def _normalize_escaped(u: str) -> str:
@@ -786,6 +806,7 @@ class MediaCandidate:
     #       ofrece contenedor al que deferir.
     # Ver `keep_authoritative()`.
     is_post_media: bool = False
+    path: tuple = ()               # rastro con indices (ver RawCandidate.path)
 
     @property
     def identity(self) -> str:
@@ -921,6 +942,7 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
     # se colaba como "formato de video".
     if rc.is_img and not is_video and not is_audio:
         return MediaCandidate(full, s, "image", h, w, None, _ext_of(url), mime,
+                              path=rc.path,
                               provenance=f"{'/'.join(rc.ancestors[-3:])}::{rc.key} "
                                          f"[{','.join(feats)}]")
     if is_video or (mime and mime.startswith("video")):
@@ -929,6 +951,7 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
         kind = "audio"
     elif is_image:
         return MediaCandidate(full, s, "image", h, w, tbr, _ext_of(url), mime,
+                              path=rc.path,
                               provenance=f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{','.join(feats)}]")
     else:
         # SIN extension ni mimetype claros. Antes esto caia a "video" siempre,
@@ -949,7 +972,8 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
         kind = "video" if has_video_evidence else "image"
 
     prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
-    return MediaCandidate(full, round(s, 1), kind, h, w, tbr, _ext_of(url), mime, prov)
+    return MediaCandidate(full, round(s, 1), kind, h, w, tbr, _ext_of(url), mime,
+                          prov, path=rc.path)
 
 
 # ==========================================================================
@@ -1416,6 +1440,50 @@ def anchor_affinity(url: str, anchor: str | None) -> float:
         a += 0.15
 
     return max(0.0, min(1.0, round(a, 3)))
+
+
+def _same_item(p1: tuple, p2: tuple) -> bool:
+    """True si dos candidatos colgaban del MISMO elemento de una lista.
+
+    La clave esta en DONDE se separan sus caminos. En un carrusel:
+
+        .../carousel_media/#1/video_versions/#0/url          <- el video
+        .../carousel_media/#1/image_versions2/.../url        <- SU caratula
+        .../carousel_media/#3/image_versions2/.../url        <- una foto
+
+    El video y su caratula comparten `.../carousel_media/#1`: el prefijo
+    comun TERMINA en un indice de lista, o sea que ambos cuelgan del mismo
+    elemento. El video y la foto solo comparten `.../carousel_media`, que
+    termina en una clave: son elementos hermanos, no el mismo.
+
+    Ese "termina en indice" es toda la regla, y no nombra ninguna plataforma.
+    """
+    n = 0
+    for a, b in zip(p1, p2):
+        if a != b:
+            break
+        n += 1
+    return n > 0 and p1[n - 1].startswith("#")
+
+
+def drop_video_posters(images: list[MediaCandidate],
+                       videos: list[MediaCandidate]) -> list[MediaCandidate]:
+    """Quita de las FOTOS las que en realidad son la caratula de un video.
+
+    Verificado en vivo con un post de Instagram de 2 fotos y 5 videos: se
+    ofrecia como "7 fotos" y bajarlas habria dado 5 fotogramas congelados en
+    vez de los videos. Como los fotogramas son JPEG perfectamente validos, la
+    verificacion de bytes no podia notarlo: el sistema habria dicho "listo, 7
+    fotos guardadas" y el usuario habria encontrado 5 archivos que no son lo
+    que pidio. Otro fallo silencioso, y de una clase nueva.
+
+    No hay nada en la URL ni en el tamano que delate a una caratula —es un
+    fotograma del mismo video, misma camara, misma escena—. Lo unico que la
+    delata es la ESTRUCTURA: cuelga del mismo elemento que un video."""
+    if not videos or not images:
+        return images
+    return [im for im in images
+            if not any(_same_item(im.path, v.path) for v in videos if v.path)]
 
 
 def _prov_slot(c: MediaCandidate) -> str:
@@ -2034,8 +2102,10 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     anchor = (metas.get("og:image") or metas.get("og:image:secure_url")
               or metas.get("twitter:image"))
     images = group_images(
-        keep_authoritative([c for c in img_scored if c.score >= MIN_IMAGE_SCORE],
-                           anchor=anchor))
+        drop_video_posters(
+            keep_authoritative([c for c in img_scored
+                                if c.score >= MIN_IMAGE_SCORE], anchor=anchor),
+            media))
 
     meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.

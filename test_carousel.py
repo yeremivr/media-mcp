@@ -113,6 +113,32 @@ PINTEREST_PIN = r"""
 """
 
 
+# ==========================================================================
+# FIXTURE D — LOGIN-WALL REAL de Instagram (capturado EN VIVO 2026-07-19).
+# Cuando Instagram no te deja ver el post, sirve su pagina de login, que trae
+# un `rsrcMap` con TODOS sus .js/.css bajo claves llamadas `src`, en un host
+# que termina en .cdninstagram.com y con una clave hermana `type`.
+# Eso sumaba cdn(46)+key(16)+dims(16)=78 -> entraban como "formatos de video",
+# y con 78 la confianza daba 0.757 > 0.6, asi que la CASCADA SE APAGABA en la
+# primera puerta y nunca se probaba /embed/captioned/.
+# Este fixture es la regresion de ese fallo real.
+# ==========================================================================
+IG_LOGIN_WALL = r"""
+<!DOCTYPE html><html><head><title>Instagram</title>
+<link rel="preconnect" href="https://static.cdninstagram.com">
+</head><body>
+<script type="application/json">
+{"require":{"rsrcMap":{
+  "D1NBIDO":{"src":"https://static.cdninstagram.com/rsrc.php/v5/ym/l/0,cross/aQtosRcH4EsLf4VtNQ2uUPs97xFZK--hB","type":"css"},
+  "BNpx00M":{"src":"https://static.cdninstagram.com/rsrc.php/v4/yn/r/g6NfOa9EYZU.js","type":"js"},
+  "E8uK18n":{"src":"https://static.cdninstagram.com/rsrc.php/v5/yw/l/0,cross/gH_BD7FcYMl.css","type":"css"},
+  "NVNq+I5":{"src":"https://static.cdninstagram.com/rsrc.php/v4iQvT4/yB/l/en_US/lHg7935Wsum.js","type":"js"}
+}}}
+</script>
+</body></html>
+"""
+
+
 def main():
     ok = True
 
@@ -286,6 +312,32 @@ def main():
                 cur.get("full_caption") and "Dijkstra" in cur["full_caption"])
     ok &= check("hashtags llegan a list_formats",
                 "#grafos" in (cur.get("hashtags") or []))
+
+    print("\n=== K. REGRESION EN VIVO: login-wall de Instagram (rsrcMap) ===")
+    k = R.resolve_html(IG_LOGIN_WALL, "https://www.instagram.com/p/DaLBFzfD_yO/")
+    print(f"    ok={k.ok} media_type={k.media_type} conf={k.confidence} "
+          f"formatos={len(k.formats)} fotos={len(k.images)}")
+    ok &= check("NINGUN .js/.css entra como formato de video",
+                not any(c.url.endswith((".js", ".css")) for c in k.formats))
+    ok &= check("no devuelve NINGUN formato (la pagina no tiene medios)",
+                len(k.formats) == 0)
+    ok &= check("no devuelve fotos falsas", len(k.images) == 0)
+    ok &= check("ok=False: admite que no encontro nada", not k.ok)
+    ok &= check("confianza por DEBAJO de 0.6 -> la cascada NO se apaga",
+                k.confidence < 0.6)
+
+    print("\n=== L. Un ganador sin altura ni bitrate NO da alta confianza ===")
+    weak = R.resolve_html(
+        '<script type="application/json">{"video":{"playable_url":'
+        '"https://video.xx.fbcdn.net/v/t42/algo?_nc_cat=1","type":"x"}}}</script>',
+        "https://www.facebook.com/reel/1")
+    print(f"    conf={weak.confidence} formatos={len(weak.formats)}")
+    ok &= check("techo de confianza aplicado (<= 0.35) para que siga la cascada",
+                weak.confidence <= R.WEAK_CONFIDENCE)
+
+    print("\n=== M. Tope de formatos (diagnostico legible) ===")
+    ok &= check("MAX_FORMATS existe y es razonable",
+                1 < R.MAX_FORMATS <= 30)
 
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())

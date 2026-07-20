@@ -131,6 +131,21 @@ VIDEO_EXT = re.compile(r"\.(mp4|m3u8|mpd|webm|mov|ts|m4v)(\?|$|/)", re.I)
 AUDIO_EXT = re.compile(r"\.(m4a|mp3|aac|opus|ogg|wav|flac)(\?|$|/)", re.I)
 IMAGE_EXT = re.compile(r"\.(jpe?g|png|webp|gif|heic|svg|ico|bmp)(\?|$|/)", re.I)
 
+# CODIGO / TIPOGRAFIAS / DATOS: jamas son el medio que el usuario quiere.
+# Descubierto EN VIVO con un post real de Instagram: su pagina de login trae un
+# `rsrcMap` con todos sus .js y .css bajo claves llamadas `src`, en un host que
+# termina en .cdninstagram.com. Sumaban cdn(46) + key(16) + dims(16) = 78 y
+# entraban como "formatos de video". Esto los descalifica de raiz.
+CODE_EXT = re.compile(
+    r"\.(js|mjs|cjs|css|json|map|wasm|woff2?|ttf|eot|otf|xml|txt|php)(\?|$|/)", re.I)
+
+# Hosts de ASSETS DE INTERFAZ (el CSS/JS/sprites del propio sitio). Comparten
+# dominio con el CDN de medios, asi que el sufijo del host NO alcanza para
+# distinguirlos: hay que mirar el subdominio y la ruta.
+STATIC_HOST_OR_PATH = re.compile(
+    r"(?i)(^|//)(static|scripts?|assets?)[\w.-]*\.(licdn|fbcdn|cdninstagram|"
+    r"twimg|pinimg)\.com|/rsrc\.php/|/static/|/assets?/|/dist/|/bundles?/")
+
 # Parametros que delatan una URL de CDN FIRMADA (token + expiracion). Su sola
 # presencia sube el puntaje: los archivos reales vienen firmados.
 SIGNED_PARAM = re.compile(
@@ -189,6 +204,24 @@ W = {
 
 # Umbral por debajo del cual NO confiamos en un candidato (cae a la cascada).
 MIN_ACCEPT_SCORE = 40.0
+
+# Extensiones que SI son reproducibles. Sirven para saber si el ganador esta
+# realmente identificado o si solo lo intuimos (ver WEAK_CONFIDENCE).
+PLAYABLE_EXTS = frozenset((
+    "mp4", "m3u8", "mpd", "webm", "mov", "ts", "m4v",
+    "m4a", "mp3", "aac", "opus", "ogg", "wav", "flac",
+))
+
+# Techo de confianza cuando el ganador no tiene NINGUNA prueba de calidad
+# (ni altura, ni bitrate, ni extension/mimetype reproducible). Debe quedar por
+# DEBAJO del 0.6 con el que resolve() corta la cascada, para que una corazonada
+# nunca impida probar la siguiente puerta.
+WEAK_CONFIDENCE = 0.35
+
+# Tope de formatos devueltos. Defensivo: en la pagina de login de Instagram
+# llegaron a colarse ~100 "formatos" (sus scripts) y el diagnostico salio de
+# 110 KB, impagable de leer. Ningun medio real tiene mas de una docena.
+MAX_FORMATS = 12
 
 # Limites de red defensivos.
 _HTTP_TIMEOUT = 15
@@ -739,6 +772,12 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
         return None
     full = parsed.geturl()
 
+    # DESCALIFICACION DURA (antes de puntuar nada): el .js de la interfaz de
+    # Instagram no es un video por mucho que viva en su CDN y su clave se
+    # llame `src`. Puntuarlo y luego restarle puntos era fragil; se corta aqui.
+    if CODE_EXT.search(url) or STATIC_HOST_OR_PATH.search(full):
+        return None
+
     key_l = rc.key.lower()
     anc_l = " ".join(rc.ancestors).lower()
     host = parsed.hostname.lower()
@@ -821,9 +860,15 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
         # en la lista de formatos reproducibles. Ahora exigimos EVIDENCIA
         # POSITIVA de video; si no la hay, lo tratamos como imagen (el pase de
         # imagen decidira si vale la pena) en vez de ensuciar los formatos.
+        # La clave `src` SOLA no alcanza: en el rsrcMap de Instagram cada
+        # script se llama `src` y vive en su CDN. Se exige una senal fuerte
+        # (mimetype de video, o venir de un <video> real) o bien una pista de
+        # nombre CORROBORADA por firma/dimensiones.
         has_video_evidence = (
-            "anc_v" in feats or "key" in feats or "dom" in feats or "vmime" in feats
-            or ("cdn" in feats and "dims" in feats and "anc_img" not in feats)
+            "vmime" in feats or "dom" in feats
+            or (("anc_v" in feats or "key" in feats)
+                and ("signed" in feats or "dims" in feats)
+                and "anc_img" not in feats)
         )
         kind = "video" if has_video_evidence else "image"
 
@@ -1007,6 +1052,9 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
     full = parsed.geturl()
+    # Misma descalificacion dura que en el pase de video (ver CODE_EXT).
+    if CODE_EXT.search(url) or STATIC_HOST_OR_PATH.search(full):
+        return None
 
     key_l = rc.key.lower()
     anc_l = " ".join(rc.ancestors).lower()
@@ -1414,6 +1462,7 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     media = _dedupe_union_find(media)
     media.sort(key=lambda c: (c.kind == "audio", -(c.score), -(c.height or 0),
                               -(c.tbr or 0)))
+    media = media[:MAX_FORMATS]
 
     # ---- PASE DE IMAGEN (carrusel / album / pin) -------------------------
     # Mismo grafo, segundo modelo. No cuesta ni un fetch mas.
@@ -1445,10 +1494,27 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
             margin = min(1.0, max(0.0, (top - media[1].score) / 40.0))
         conf = round(0.7 * sat + 0.3 * (0.5 + 0.5 * margin), 3)
 
+        # TECHO POR FALTA DE EVIDENCIA DE CALIDAD (aprendido EN VIVO con un
+        # post real de Instagram). Un ganador SIN altura, SIN bitrate y SIN
+        # extension/mimetype reproducible no es un archivo identificado: es
+        # una corazonada. Antes eso puntuaba 0.757 y, como el umbral de corte
+        # es 0.6, la cascada se APAGABA en la primera puerta y el motor nunca
+        # llegaba al /embed/captioned/ donde estaba el carrusel de verdad.
+        # Con el techo bajo, una corazonada ya no calla a las demas puertas:
+        # es justo para lo que construimos la cascada.
+        win = media[0]
+        if not (win.height or win.tbr or (win.ext or "") in PLAYABLE_EXTS
+                or (win.mime or "").startswith(("video", "audio"))):
+            conf = min(conf, WEAK_CONFIDENCE)
+
     # Sin video pero CON fotos, la confianza la marca el pase de imagen.
     if not media and images:
         top_i = max(c.score for c in images)
         conf = round(min(1.0, top_i / 100.0) * 0.85, 3)
+        # Mismo criterio: si de NINGUNA foto conocemos su tamano, no sabemos
+        # si son las del post o adornos -> que la cascada siga buscando.
+        if not any((c.width or c.height) for c in images):
+            conf = min(conf, WEAK_CONFIDENCE)
 
     # QUE ES ESTO: la respuesta que Claude necesita para no adivinar mirando
     # el link. `video` manda si hay algo reproducible (el usuario que comparte

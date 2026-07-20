@@ -1331,6 +1331,7 @@ def resolve_media(url: str) -> dict:
             "score": c.score,
             "url_preview": c.url[:90],
             "from": c.provenance,
+            "path": "/".join(getattr(c, "path", ()) or ()),
         } for i, c in enumerate(getattr(res, "images", []) or [])],
         "formats": [{
             "format_id": (f"cauce-a-0" if f.kind == "audio" else f"cauce-v-{f.height or 0}"),
@@ -1339,6 +1340,7 @@ def resolve_media(url: str) -> dict:
             "score": f.score,
             "url_preview": f.url[:90],
             "from": f.provenance,
+            "path": "/".join(getattr(f, "path", ()) or ()),
         } for f in res.formats],
         "reason": res.reason,
         "diagnostics": res.diagnostics,

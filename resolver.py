@@ -1738,6 +1738,7 @@ class ResolveResult:
                 "_cauce_score": c.score,
                 "_cauce_muxed": muxed,
                 "_cauce_provenance": c.provenance,
+                "_cauce_path": "/".join(c.path),
             })
         return {
             "title": self.title,
@@ -1761,6 +1762,10 @@ class ResolveResult:
                 "ext": c.ext or "jpg",
                 "score": c.score,
                 "provenance": c.provenance,
+                # El camino CON indices de lista. Sin verlo de verdad no se
+                # puede emparejar un video con su caratula: Instagram sirve
+                # las fotos y los videos en estructuras PARALELAS.
+                "path": "/".join(c.path),
             } for i, c in enumerate(self.images)],
             "webpage_url": self.url,
         }

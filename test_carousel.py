@@ -741,44 +741,85 @@ def main():
     # de sastre donde cuelgan el post, los vecinos, el placeholder borroso y
     # hasta el permalink de un video ajeno.
     LK = "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id="
+    IG = "https://instagram.flim38-1.fna.fbcdn.net/v/"
 
-    def _fb(u, w, h, s):
+    def _c(u, prov, w=None, h=None, s=76):
         return R.MediaCandidate(url=u, score=s, kind="image", width=w,
-                                height=h, is_post_media=True)
+                                height=h, is_post_media=True, provenance=prov)
 
     ENTERCORE = [
-        _fb(LK + "1523758276433683", 512, 640, 76),    # EL MEME (= og:image)
-        _fb(LK + "1395159759095153", 225, 225, 56),    # post vecino
-        _fb(LK + "1029224036749977", 261, 163, 56),    # post vecino
-        _fb(LK + "27531537473140125", 168, 209, 56),   # post vecino
-        _fb("https://scontent.flim38-1.fna.fbcdn.net/v/t15.5256-10/"
-            "752576154_1046134134732361_217287752.jpg", 960, 960, 134),
-        _fb("https://www.facebook.com/61585103860771/videos/"
-            "1334593682178915/", 576, 1024, 76),       # permalink de VIDEO
-        _fb(LK + "1334593682178915", 576, 1024, 76),   # miniatura de ese video
-        _fb(LK + "1078546248176237", 128, 225, 56),    # post vecino
-        _fb(LK + "2919417081754717", 261, 224, 56),    # post vecino
+        _c(LK + "1523758276433683",
+           "attachment/media/photo_image::uri [key,dims,carousel,big]",
+           512, 640),                                   # EL MEME (= og:image)
+        _c(LK + "1395159759095153",
+           "attachment/media/image::uri [key,dims,carousel]", 225, 225, 56),
+        _c(LK + "1029224036749977",
+           "attachment/media/image::uri [key,dims,carousel]", 261, 163, 56),
+        _c(LK + "27531537473140125",
+           "attachment/media/image::uri [key,dims,carousel]", 168, 209, 56),
+        _c("https://scontent.flim38-1.fna.fbcdn.net/v/t15.5256-10/"
+           "752576154_1046134134732361_217287752.jpg",
+           "attachment/media/blurred_image::uri [cdn,signed,carousel,big]",
+           960, 960, 134),                              # placeholder borroso
+        _c("https://www.facebook.com/61585103860771/videos/1334593682178915/",
+           "style_type_renderer/attachment/media::permalink_url "
+           "[key,dims,carousel,big]", 576, 1024),       # permalink de VIDEO
+        _c(LK + "1334593682178915",
+           "style_type_renderer/attachment/media::seo_web_crawler_lookaside_url"
+           " [key,dims,carousel,big]", 576, 1024),
+        _c(LK + "1078546248176237",
+           "attachment/media/image::uri [key,dims,carousel]", 128, 225, 56),
+        _c(LK + "2919417081754717",
+           "attachment/media/image::uri [key,dims,carousel]", 261, 224, 56),
     ]
     kept = R.keep_authoritative(ENTERCORE, LK + "1523758276433683")
     ok &= check("un post de UNA foto devuelve UNA foto (antes: nueve)",
                 len(kept) == 1)
-    ok &= check("y la que queda es el medio del post, no el mas puntuado "
-                "(el borroso puntuaba 134 y sobra)",
+    ok &= check("y queda el medio del post, no el mas puntuado (el borroso "
+                "puntuaba 134 y el bueno 76)",
                 kept and kept[0].url.endswith("1523758276433683"))
 
-    # NO ROMPER el carrusel de verdad: mismas URLs reales del post de 5 fotos
-    # verificado en vivo (5/5 descargadas). Sus media_id se acunaron juntos,
-    # asi que comparten prefijo y el ancla los reconoce como hermanos.
-    CINCO = [_fb(LK + i, 1080, 1080, 76) for i in
+    # EL CASO QUE TUMBO MI PRIMERA REGLA. Carrusel MIXTO de Instagram (5 fotos
+    # + video), datos reales. Sus fotos se subieron en momentos distintos, asi
+    # que los id NO son hermanos: la afinidad de ancla daba 0.00 en tres de
+    # las cinco. Un veto por parecido se las habria llevado por delante. El
+    # parentesco de id sirve para RECHAZAR intrusos, no para ADMITIR miembros.
+    P = "carousel_media/image_versions2/candidates::url"
+    MIXTO = [
+        _c(IG + "t51.82787-15/654593291_18079113764102329_667247_n.jpg",
+           P + " [cdn,iext,signed,key,carousel,big]", 1080, 1080),
+        _c(IG.replace("38", "28") + "t51.75761-15/"
+           "472987024_18049131551473496_2300132375648910107_n.jpg",
+           P + " [cdn,iext,signed,key,dims,carousel,big]", 720, 720),
+        _c(IG + "t51.82787-15/655325362_18154963231446696_163327_n.jpg",
+           P + " [cdn,iext,signed,key,carousel,big]", 1080, 1080),
+        _c(IG.replace("38", "28") +
+           "t51.82787-15/669878108_18262800781295936_554816_n.jpg",
+           P + " [cdn,iext,signed,key,carousel,big]", 1080, 1080),
+        _c(IG + "t51.75761-15/473058021_18049131533473496_524758_n.jpg",
+           P + " [cdn,iext,signed,key,dims,carousel,big]", 720, 720),
+    ]
+    ANC_MIXTO = ("https://scontent.cdninstagram.com/v/t51.75761-15/"
+                 "472987024_18049131551473496_2300132375648910107_n.jpg"
+                 "?stp=cmp1_dst-jpg_e35_s640x640_tt6")
+    ok &= check("carrusel mixto: las 5 fotos SOBREVIVEN aunque sus id no sean "
+                "hermanos (un veto por parecido perdia 3)",
+                len(R.keep_authoritative(MIXTO, ANC_MIXTO)) == 5)
+    ok &= check("y esos hermanos de verdad NO se parecen entre si",
+                R.anchor_affinity(MIXTO[0].url, ANC_MIXTO)
+                < R.ANCHOR_MIN_AFFINITY)
+
+    # NO ROMPER el carrusel que ya funcionaba (5/5 descargadas en vivo).
+    CINCO = [_c(LK + i, "nodes/media/viewer_image::uri "
+                        "[key,dims,carousel,big]", 1080, 1080) for i in
              ("122141642061152120", "122141642073152120", "122141642085152120",
               "122141642067152120", "122141642079152120")]
     ok &= check("un carrusel real de 5 sigue devolviendo 5",
                 len(R.keep_authoritative(CINCO, LK + "122141642061152120")) == 5)
 
-    # Red de seguridad: si el ancla no se parece a NADA del contenedor (puede
-    # ser de otra naturaleza, p.ej. la portada de un video frente a sus
-    # pistas), NO nos quedamos sin nada: manda el contenedor, como siempre.
-    ok &= check("si el ancla no casa con nada, el contenedor sigue mandando",
+    # Red de seguridad: si el ancla no aparece entre los candidatos no hay a
+    # quien deferir y manda el contenedor, como siempre.
+    ok &= check("si el ancla no esta entre los candidatos, manda el contenedor",
                 len(R.keep_authoritative(
                     CINCO, "https://otrositio.com/imagen-sin-relacion.jpg")) == 5)
 

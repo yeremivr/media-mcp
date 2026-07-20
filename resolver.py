@@ -1418,6 +1418,15 @@ def anchor_affinity(url: str, anchor: str | None) -> float:
     return max(0.0, min(1.0, round(a, 3)))
 
 
+def _prov_slot(c: MediaCandidate) -> str:
+    """El SITIO de la estructura del que salio un candidato, sin los rasgos.
+
+    `provenance` es "ancestros::clave [rasgos]" y los rasgos varian entre
+    hermanos (uno declara dimensiones y otro no), asi que compararla entera
+    separaria medios que salieron del mismo sitio. El sitio es lo estable."""
+    return (c.provenance or "").split(" [")[0]
+
+
 def keep_authoritative(cands: list[MediaCandidate],
                        anchor: str | None = None) -> list[MediaCandidate]:
     """SI hay evidencia POSITIVA de cuales son los medios DEL POST, esos mandan
@@ -1471,11 +1480,49 @@ def keep_authoritative(cands: list[MediaCandidate],
         # og:image sea de otra naturaleza que los medios del contenedor (una
         # portada de video frente a las pistas, por ejemplo). En ese caso el
         # contenedor sigue mandando, que es el comportamiento de siempre.
+        # QUE COHORTE, no que parecido. Primero intente vetar por afinidad de
+        # ancla y los datos reales lo tumbaron: en un carrusel de Instagram
+        # cuyas fotos se subieron en momentos distintos, los id NO son
+        # hermanos (afinidad 0.00 en 3 de 5) y el veto se habria llevado por
+        # delante fotos legitimas. El parentesco de id sirve para RECHAZAR
+        # intrusos, no para ADMITIR miembros.
+        #
+        # Lo que si separa los dos casos, mirando las procedencias reales:
+        #
+        #   Instagram, las 5 buenas -> carousel_media/image_versions2/candidates
+        #   EnterCore, el meme      -> attachment/media/photo_image
+        #   EnterCore, los vecinos  -> attachment/media/image
+        #   EnterCore, el borroso   -> attachment/media/blurred_image
+        #
+        # Los medios de UN post salen del MISMO sitio de la estructura, porque
+        # los emite el mismo trozo de codigo de la plataforma. La basura sale
+        # de otro. Y el ancla, que por contrato es un medio del post, nos dice
+        # cual de esos grupos es el bueno: se busca al ancla entre los
+        # candidatos y se conserva su cohorte entera.
+        #
+        # Es mas fuerte que el veto y no exige que los medios se parezcan
+        # entre si: admite hermanos que no comparten ni id ni tamano, con tal
+        # de que la plataforma los haya emitido juntos.
         if anchor:
-            near = [c for c in authoritative
-                    if anchor_affinity(c.url, anchor) >= ANCHOR_MIN_AFFINITY]
-            if near:
-                return near
+            anchor_id = image_identity(anchor)
+            slot = next((_prov_slot(c) for c in authoritative
+                         if image_identity(c.url) == anchor_id), None)
+            if slot:
+                # El cohorte elige QUE FOTOS, no que URLs: la version chica y
+                # la grande de una misma foto pueden salir de sitios distintos
+                # de la estructura, y filtrar por URL se quedaba con la chica
+                # y tiraba la de 1080 (lo caz un test que ya existia). Se
+                # toman las IDENTIDADES del cohorte y luego se conservan todas
+                # sus renditions, vengan de donde vengan; `group_images` ya
+                # sabe quedarse con la mayor de cada una.
+                ids = {image_identity(c.url) for c in authoritative
+                       if _prov_slot(c) == slot}
+                cohort = [c for c in authoritative
+                          if image_identity(c.url) in ids]
+                if cohort:
+                    return cohort
+        # Sin ancla, o con un ancla que no aparece entre los candidatos, no hay
+        # a quien deferir: manda el contenedor, como siempre.
         return authoritative
 
     if anchor:

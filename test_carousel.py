@@ -433,11 +433,11 @@ def main():
     o = R.resolve_html(IG_GRID_MIXED, "https://www.instagram.com/p/Da6GnH8HGW4/")
     for i, c in enumerate(o.images, 1):
         print(f"    {i}. [{c.score:6.1f}] {c.width}x{c.height} "
-              f"cont={c.from_container} {c.url[:62]}")
+              f"post={c.is_post_media} {c.url[:62]}")
     ok &= check("SOLO las 3 del contenedor (descarta los 3 <img> sueltos)",
                 len(o.images) == 3)
     ok &= check("todas vienen del contenedor estructurado",
-                all(c.from_container for c in o.images))
+                all(c.is_post_media for c in o.images))
     ok &= check("ninguna es de 640x640 (esas eran la cuadricula)",
                 all(c.width == 1080 for c in o.images))
     ok &= check("EL CAPTION ES EL DE ESTE POST, no el mas largo del documento",
@@ -480,6 +480,43 @@ def main():
     ok &= check("saca el handle como autor", q.uploader == "cosmopolitan")
     ok &= check("los hashtags siguen saliendo",
                 q.hashtags == ["#AndrewGarfield", "#Wimbledon"])
+
+    print("\n=== R. LinkedIn REAL: feedshare manda sobre 16 fotos de perfil ===")
+    # Capturado EN VIVO del post de OpenAI sobre su chip Jalapeño. LinkedIn
+    # sirve TODO como <img> suelto (no hay contenedor), asi que la autoridad
+    # tiene que salir del nombre de la rendition: `feedshare-` es el post,
+    # `profile-displayphoto-` son quienes comentaron, `image-scale_` es la
+    # vista previa del enlace.
+    LI_REAL = (
+        '<meta property="og:title" content="OpenAI on LinkedIn: '
+        '&quot;We have designed and built our first AI chip: Jalapeno.&quot;">'
+        '<meta property="og:description" content="We have designed and built our '
+        'first AI chip: Jalapeno. Purpose-built for the LLM workloads powering '
+        'ChatGPT and the API. | 432 comments on LinkedIn">'
+        '<meta property="og:image" content="https://media.licdn.com/dms/image/v2/'
+        'D5622AQF-wmKFPe2xdg/feedshare-shrink_800/B56Z750Bn_IQAc-/0/1782307626233?e=1&t=A">'
+        '<img src="https://media.licdn.com/dms/image/v2/D4D03AQHfWVqf-HH67g/'
+        'profile-displayphoto-scale_400_400/B4E/0/1700000000001?e=1&t=B">'
+        '<img src="https://media.licdn.com/dms/image/v2/D5603AQGY2L4pJXbhrQ/'
+        'profile-displayphoto-shrink_400_400/B4E/0/1700000000002?e=1&t=C">'
+        '<img src="https://media.licdn.com/dms/image/v2/D563DAQEiLbFUDLFr1g/'
+        'image-scale_191_1128/image-scale_191_1128/0/1700000000003?e=1&t=D">'
+    )
+    r_ = R.resolve_html(LI_REAL, "https://www.linkedin.com/posts/openai-chip-7475540008238538752-a7tn/")
+    for i, c in enumerate(r_.images, 1):
+        print(f"    {i}. [{c.score:6.1f}] {c.width}x{c.height} post={c.is_post_media}")
+        print(f"        {c.url[:88]}")
+    ok &= check("SOLO la foto del post (1), no las 3 intrusas", len(r_.images) == 1)
+    ok &= check("es la feedshare", r_.images and "feedshare" in r_.images[0].url)
+    ok &= check("descarta las profile-displayphoto (avatares de LinkedIn)",
+                not any("displayphoto" in c.url for c in r_.images))
+    ok &= check("descarta la vista previa del enlace (image-scale_)",
+                not any("image-scale" in c.url for c in r_.images))
+    ok &= check("uploader desde 'OpenAI on LinkedIn:'", r_.uploader == "OpenAI")
+    ok &= check("el caption NO arrastra '| 432 comments on LinkedIn'",
+                r_.full_caption and "comments on LinkedIn" not in r_.full_caption)
+    ok &= check("el caption SI conserva el texto real",
+                r_.full_caption and "Jalapeno" in r_.full_caption)
 
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())

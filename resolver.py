@@ -710,11 +710,15 @@ class MediaCandidate:
     mime: str | None = None
     provenance: str = ""           # de donde salio (para depurar / transparencia)
     order: int = 0                 # posicion en el documento (orden del carrusel)
-    # True si salio de un CONTENEDOR ESTRUCTURADO de medios del post
-    # (carousel_media, edge_sidecar_to_children, image_versions...). Ver
-    # `keep_authoritative()`: si el documento tiene contenedor, manda el
-    # contenedor y los <img> sueltos de la pagina se descartan.
-    from_container: bool = False
+    # True si hay EVIDENCIA POSITIVA de que este archivo es el medio DE ESTE
+    # POST. Dos formas de conseguirla, y basta con una:
+    #   (a) salir de un CONTENEDOR estructurado (carousel_media, sidecar,
+    #       image_versions) -> Instagram, Facebook;
+    #   (b) tener una RENDITION DE CONTENIDO en la URL (feedshare-, /dms/
+    #       document/) -> LinkedIn, que sirve todo como <img> suelto y no
+    #       ofrece contenedor al que deferir.
+    # Ver `keep_authoritative()`.
+    is_post_media: bool = False
 
     @property
     def identity(self) -> str:
@@ -961,10 +965,25 @@ STATIC_ASSET_HINT = re.compile(
 )
 
 # Tokens que delatan un avatar / logo / icono en el path o en las claves.
+# `displayphoto`/`framedphoto` son los nombres REALES de LinkedIn
+# (profile-displayphoto-scale_400_400): visto en vivo colandose 16 fotos de
+# perfil de quienes comentaron un post. Los patrones genericos tipo
+# "profile-pic" no los cubrian.
 AVATAR_HINT = re.compile(
-    r"(?i)(avatar|profile[-_]?pic|profile_image|/pfp|headshot|company[-_]?logo|"
+    r"(?i)(avatar|profile[-_]?pic|profile_image|display[-_]?photo|"
+    r"framed[-_]?photo|member[-_]?photo|/pfp|headshot|company[-_]?logo|"
     r"\blogo\b|/icon|placeholder|ghost|default[-_]?user|badge|watermark)",
 )
+
+# RENDITIONS DE CONTENIDO: las plataformas nombran la version segun PARA QUE
+# sirve el archivo, y ese nombre es una declaracion de proposito tan fuerte
+# como estar dentro de un contenedor. LinkedIn usa `feedshare-*` para el medio
+# del post, y `profile-displayphoto-*` / `company-logo-*` / `image-scale-*`
+# (vista previa de un enlace) para todo lo demas. Instagram hace lo analogo con
+# el prefijo de path (t51.2885-15 contenido vs -19 perfil).
+CONTENT_RENDITION = re.compile(
+    r"(?i)[/_-](feedshare|articleshare|documentshare|ugcshare|videocover)[-_/]"
+    r"|/dms/document/")
 
 # Instagram/Facebook codifican el TIPO de foto en el prefijo del path:
 #   t51.2885-15 -> foto de FEED (contenido)   |  t51.2885-19 -> FOTO DE PERFIL
@@ -1156,31 +1175,39 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
     if TRACKING_HINT.search(url):
         s += WI["tracking"]; feats.append("track")
 
+    if CONTENT_RENDITION.search(full):
+        feats.append("content")
+
     prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
     return MediaCandidate(full, round(s, 1), "image", eff_h, eff_w, None,
                           ext, None, prov, order=rc.order,
-                          from_container=("carousel" in feats))
+                          is_post_media=("carousel" in feats or "content" in feats))
 
 
 def keep_authoritative(cands: list[MediaCandidate]) -> list[MediaCandidate]:
-    """SI la pagina trae un CONTENEDOR ESTRUCTURADO de medios, ese contenedor
-    ES la autoridad y todo lo demas sobra.
+    """SI hay evidencia POSITIVA de cuales son los medios DEL POST, esos mandan
+    y todo lo demas sobra.
 
-    Descubierto EN VIVO: un post de 3 fotos devolvia 12. Las 3 reales colgaban
-    de `carousel_media/image_versions2/candidates`; las otras 9 eran <img>
-    sueltos del HTML — la cuadricula del perfil. Mismo CDN, firmadas, 640x640,
-    116 puntos: por rasgos propios son indistinguibles de una foto buena.
+    Descubierto EN VIVO, dos veces y de dos formas distintas:
 
-    Lo que SI las distingue es estructural: Instagram (y Facebook, y LinkedIn)
-    declaran los medios DEL POST dentro de un contenedor con nombre, y ese
-    contenedor esta COMPLETO. Un <img> suelto en el documento es mobiliario de
-    la pagina: cuadricula, sugeridos, publicaciones relacionadas.
+      * Instagram: un post de 3 fotos devolvia 12. Las 3 reales colgaban de
+        `carousel_media/image_versions2/candidates`; las otras 9 eran <img>
+        sueltos — la cuadricula del perfil. Autoridad = el CONTENEDOR.
+      * LinkedIn: un post de 1 foto devolvia 18. La real era `feedshare-
+        shrink_800`; las otras 17 eran fotos de perfil de quienes comentaron
+        (`profile-displayphoto-*`) y la vista previa de un enlace. Aqui NO hay
+        contenedor —LinkedIn sirve todo como <img> suelto— pero el nombre de la
+        RENDITION declara el proposito igual de claro.
 
-    Regla: si ALGUN candidato vino de contenedor, se conservan solo esos. Si
-    NINGUNO vino de contenedor (Pinterest, blogs, HTML plano), no hay autoridad
-    a la que deferir y se conservan todos."""
-    from_container = [c for c in cands if c.from_container]
-    return from_container if from_container else cands
+    En ambos casos los intrusos son indistinguibles por rasgos propios: mismo
+    CDN, firmados, dimensiones plausibles. Solo los separa saber que el archivo
+    fue puesto ahi PARA ESTE POST.
+
+    Regla: si ALGUN candidato tiene esa evidencia, se conservan solo esos. Si
+    NINGUNO la tiene (Pinterest, blogs, HTML plano), no hay autoridad a la que
+    deferir y se conservan todos."""
+    authoritative = [c for c in cands if c.is_post_media]
+    return authoritative if authoritative else cands
 
 
 def group_images(cands: list[MediaCandidate]) -> list[MediaCandidate]:
@@ -1352,10 +1379,23 @@ _CAPTION_NOISE = re.compile(
 )
 
 
+# LinkedIn cierra su og:description con metricas: "<caption> | 432 comments on
+# LinkedIn". Igual que la envoltura de Instagram, es ruido en cada post.
+_SOCIAL_TAIL = re.compile(
+    r"(?i)\s*[|·-]\s*[\d.,]+[KMB]?\s+(?:comments?|reactions?|likes?|shares?)"
+    r"(?:\s+on\s+\w+)?\s*\.?\s*$")
+
+
 def _clean_caption(t) -> str | None:
     if not isinstance(t, str):
         return None
     t = re.sub(r"\s+\n", "\n", t.replace("\r", "")).strip()
+    # Puede haber mas de una metrica encadenada al final.
+    for _ in range(3):
+        t2 = _SOCIAL_TAIL.sub("", t).strip()
+        if t2 == t:
+            break
+        t = t2
     if len(t) < 12 or len(t) > 6000:
         return None
     if _CAPTION_NOISE.match(t):

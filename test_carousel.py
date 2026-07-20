@@ -835,32 +835,54 @@ def main():
     # del propio video, misma camara y misma escena. Solo la delata la
     # ESTRUCTURA, y solo si se conserva la POSICION dentro de las listas --
     # que es justo lo que el DFS tiraba.
-    B = ("xdt_api", "items", "#0", "carousel_media")
-    VID1 = B + ("#1", "video_versions", "#0", "url")
-    POST1 = B + ("#1", "image_versions2", "candidates", "#0", "url")
-    FOTO3 = B + ("#3", "image_versions2", "candidates", "#0", "url")
+    # CAMINOS REALES capturados del post con el diagnostico instrumentado.
+    # Los videos salieron en los elementos 0,2,3,4,5 y no hay video en el 1 ni
+    # en el 6 -- que es EXACTAMENTE la verdad de campo del usuario: 5 videos y
+    # 2 fotos. La reconstruccion cierra sin un solo hueco.
+    RAIZ = ("require/#0/#3/#0/__bbox/require/#7/#3/#1/__bbox/result/data/"
+            "xig_polaris_media")
 
-    ok &= check("un video y SU caratula cuelgan del mismo elemento",
-                R._same_item(VID1, POST1))
-    ok &= check("un video y una foto de OTRO elemento, no",
-                not R._same_item(VID1, FOTO3))
-    ok &= check("dos elementos hermanos tampoco se confunden entre si",
-                not R._same_item(POST1, FOTO3))
+    def _vid(i):
+        return tuple((f"{RAIZ}/if_not_gated_logged_out/carousel_media/#{i}"
+                      "/video_versions/#0/url").split("/"))
 
-    def _pc(p, kind):
-        return R.MediaCandidate(url="https://cdn/" + "/".join(p), score=100,
-                                kind=kind, path=p)
+    def _img(i, gated=False):
+        mid = "if_not_gated_logged_out/" if gated else ""
+        return tuple((f"{RAIZ}/{mid}carousel_media/#{i}"
+                      "/image_versions2/candidates/#0/url").split("/"))
 
-    quedan = R.drop_video_posters([_pc(POST1, "image"), _pc(FOTO3, "image")],
-                                  [_pc(VID1, "video")])
-    ok &= check("se cae la caratula y sobrevive la foto de verdad",
-                len(quedan) == 1 and quedan[0].path == FOTO3)
+    # La 1a version comparaba el PREFIJO COMUN exigiendo que terminara en
+    # indice, y fallo EN VIVO: Instagram envuelve solo los videos en
+    # `if_not_gated_logged_out`, asi que fotos y videos van por RAMAS
+    # PARALELAS y su prefijo comun ni llega al carrusel. Debe aguantar las dos
+    # formas, porque no sabemos cual usara la plataforma manana.
+    for gated in (False, True):
+        etq = "misma rama" if gated else "ramas paralelas"
+        ok &= check(f"[{etq}] el video #0 y SU caratula son el mismo elemento",
+                    R._same_item(_vid(0), _img(0, gated)))
+        ok &= check(f"[{etq}] el video #0 y la foto del #1, no",
+                    not R._same_item(_vid(0), _img(1, gated)))
+
+    # La 2a version miraba solo el contenedor comun MAS PROFUNDO, y dos fotos
+    # de elementos distintos comparten la lista de renditions (`candidates`)
+    # siendo ambas la #0 de la suya -> falso positivo. Por eso ahora ningun
+    # contenedor compartido puede discrepar.
+    ok &= check("dos fotos de elementos distintos no se confunden",
+                not R._same_item(_img(1), _img(3)))
+
+    VIDS = [R.MediaCandidate(url=f"v{i}", score=110, kind="video", path=_vid(i))
+            for i in (0, 2, 3, 4, 5)]
+    FOTOS = [R.MediaCandidate(url=f"f{i}", score=140, kind="image",
+                              path=_img(i)) for i in range(7)]
+    ok &= check("el post real: de 7 'fotos' quedan las 2 de verdad (#1 y #6)",
+                [c.url for c in R.drop_video_posters(FOTOS, VIDS)]
+                == ["f1", "f6"])
     ok &= check("sin videos en el post no se toca ninguna foto",
-                len(R.drop_video_posters(
-                    [_pc(POST1, "image"), _pc(FOTO3, "image")], [])) == 2)
+                len(R.drop_video_posters(FOTOS, [])) == 7)
     ok &= check("candidatos sin rastro de posicion no se descartan por error",
-                len(R.drop_video_posters([_pc((), "image")],
-                                         [_pc(VID1, "video")])) == 1)
+                len(R.drop_video_posters(
+                    [R.MediaCandidate(url="x", score=1, kind="image")],
+                    VIDS)) == 1)
 
     print("\n=== X. que lo aprendido SOBREVIVA al reinicio ===")
     # Las memorias de puertas eran dicts en RAM: se vaciaban en cada

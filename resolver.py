@@ -1301,7 +1301,15 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
     prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
     return MediaCandidate(full, round(s, 1), "image", eff_h, eff_w, None,
                           ext, None, prov, order=rc.order,
-                          is_post_media=("carousel" in feats or "content" in feats))
+                          is_post_media=("carousel" in feats or "content" in feats),
+                          # ESTE es el constructor que fabrica las fotos que ve
+                          # el usuario. Al anadir `path` parchee los otros tres
+                          # y me deje justo este: las imagenes salian con el
+                          # camino VACIO y `drop_video_posters` comparaba
+                          # contra la nada, asi que no descartaba una sola
+                          # caratula. El diagnostico lo delato: "path": "" en
+                          # las siete fotos y camino completo en los videos.
+                          path=rc.path)
 
 
 # ==========================================================================
@@ -1442,28 +1450,61 @@ def anchor_affinity(url: str, anchor: str | None) -> float:
     return max(0.0, min(1.0, round(a, 3)))
 
 
+def _coords(path: tuple) -> list:
+    """Las COORDENADAS de un camino: cada par (contenedor, indice) por el que
+    pasa. De `a/#0/carousel_media/#3/video_versions/#0/url` salen
+    ('a','#0'), ('carousel_media','#3'), ('video_versions','#0')."""
+    out = []
+    for i in range(1, len(path)):
+        if path[i].startswith("#") and not path[i - 1].startswith("#"):
+            out.append((path[i - 1], path[i]))
+    return out
+
+
 def _same_item(p1: tuple, p2: tuple) -> bool:
-    """True si dos candidatos colgaban del MISMO elemento de una lista.
+    """True si dos candidatos cuelgan del MISMO elemento de una coleccion.
 
-    La clave esta en DONDE se separan sus caminos. En un carrusel:
+    Primero intente comparar el PREFIJO COMUN de los dos caminos, exigiendo
+    que terminara en un indice. Fallo en vivo, y la autopsia explica por que:
+    Instagram sirve las fotos y los videos en RAMAS PARALELAS del mismo JSON.
+    Capturado de un post real:
 
-        .../carousel_media/#1/video_versions/#0/url          <- el video
-        .../carousel_media/#1/image_versions2/.../url        <- SU caratula
-        .../carousel_media/#3/image_versions2/.../url        <- una foto
+      .../xig_polaris_media/if_not_gated_logged_out/carousel_media/#0/video_versions/#0/url
+      .../xig_polaris_media/carousel_media/#0/image_versions2/candidates/#0/url
 
-    El video y su caratula comparten `.../carousel_media/#1`: el prefijo
-    comun TERMINA en un indice de lista, o sea que ambos cuelgan del mismo
-    elemento. El video y la foto solo comparten `.../carousel_media`, que
-    termina en una clave: son elementos hermanos, no el mismo.
+    Sus caminos se separan ARRIBA, en `if_not_gated_logged_out`, asi que el
+    prefijo comun ni siquiera llega al carrusel. Comparar prefijos absolutos
+    da falso aunque ambos sean, evidentemente, el elemento 0.
 
-    Ese "termina en indice" es toda la regla, y no nombra ninguna plataforma.
+    La regla que si aguanta: los dos caminos pasan por un contenedor que se
+    llama IGUAL (`carousel_media`) y cada uno declara ahi su indice. Se busca
+    el contenedor comun MAS PROFUNDO y se comparan esas coordenadas. Da igual
+    por cuantas ramas o envoltorios llegue cada uno; lo que importa es que
+    ocupen la misma posicion en la misma coleccion.
+
+    No se nombra ninguna plataforma: no se exige que el contenedor se llame
+    `carousel_media`, solo que sea el mismo en ambos caminos.
+
+    Un matiz que costo otro fallo: no vale mirar SOLO el contenedor comun mas
+    profundo. Dos fotos de elementos distintos comparten tambien la lista de
+    renditions (`candidates`) y las dos son la #0 de la suya, asi que el
+    contenedor mas profundo decia "mismo elemento" cuando no lo era. La regla
+    es mas estricta y mas simple: de TODOS los contenedores que comparten,
+    ninguno puede discrepar. En cuanto uno lo hace, son elementos distintos.
     """
-    n = 0
-    for a, b in zip(p1, p2):
-        if a != b:
-            break
-        n += 1
-    return n > 0 and p1[n - 1].startswith("#")
+    c1, c2 = _coords(p1), _coords(p2)
+    if not c1 or not c2:
+        return False
+    por_clave: dict = {}
+    for k, idx in c2:
+        por_clave.setdefault(k, set()).add(idx)
+    compartido = False
+    for k, idx in c1:
+        if k in por_clave:
+            if idx not in por_clave[k]:
+                return False             # discrepan: elementos distintos
+            compartido = True
+    return compartido
 
 
 def drop_video_posters(images: list[MediaCandidate],

@@ -680,6 +680,54 @@ def main():
                 R.fetch_image_bytes("https://ejemplo.com/x.jpg",
                                     fetch=lambda u, ua, **k: LOGIN_HTML) is None)
 
+    print("\n=== Y. el identificador puede vivir en el QUERY, no en la ruta ===")
+    # Capturado EN VIVO: un post de Facebook con UNA sola foto se reporto como
+    # carrusel de NUEVE (iconos de reacciones, miniaturas de otros posts y el
+    # logo de un anuncio). El motor daba por supuesto que la identidad de un
+    # medio vive en el PATH; Facebook sirve todo desde el mismo
+    # `/lookaside/crawler/media/` y distingue por `?media_id=`.
+    #
+    # Por que el post de 5 fotos SI funcionaba y este no: aquel era un
+    # carrusel, tenia CONTENEDOR, y `keep_authoritative` resolvia en el
+    # escalon 1 sin llegar a consultar el ancla. Con UNA foto no hay
+    # contenedor -> el ancla es la unica defensa -> y estaba ciega.
+    #
+    # HONESTIDAD SOBRE ESTE FIXTURE: las URLs de lookaside son REALES
+    # (capturadas en vivo); el HTML que las envuelve lo escribi yo. Vale para
+    # fijar la regresion del ancla, NO como prueba de que la pagina real de
+    # Facebook tenga esta forma.
+    FB_ANCLA = ("https://lookaside.fbsbx.com/lookaside/crawler/media/"
+                "?media_id=122141642061152120")
+    FB_OTRO = ("https://lookaside.fbsbx.com/lookaside/crawler/media/"
+               "?media_id=987654321098765432")
+
+    ok &= check("el id se encuentra aunque la ruta no lo lleve",
+                R._media_ids(FB_ANCLA) == ["122141642061152120"])
+    ok &= check("hermana del MISMO post supera el umbral",
+                R.anchor_affinity(
+                    FB_ANCLA.replace("061152120", "073152120"),
+                    FB_ANCLA) >= R.ANCHOR_MIN_AFFINITY)
+    ok &= check("basura de OTRO post NO lo supera (antes empataban en 0.25)",
+                R.anchor_affinity(FB_OTRO, FB_ANCLA) < R.ANCHOR_MIN_AFFINITY)
+    ok &= check("la identidad sale del id, no de la URL entera",
+                R.image_identity(FB_ANCLA)
+                == R.image_identity(FB_ANCLA + "&width=640"))
+
+    # La regla es "el query SOLO si la ruta calla": las plataformas cuyo path
+    # ya identifica el medio no deben cambiar en nada. Si esto se rompe, los
+    # tokens de FIRMA de Instagram (_nc_ohc, oh, oe) entrarian en la
+    # comparacion de ids y la volverian ruidosa.
+    IG = ("https://scontent.cdninstagram.com/v/t51.2885-15/"
+          "111111111_222222222_333333333_n.jpg?stp=dst-jpg_s1080x1080"
+          "&_nc_ohc=AAAAAAAAAAAA&oh=00_ZZZZZZZZ&oe=6A63")
+    ok &= check("Instagram sigue sacando el id del PATH, no del query",
+                R._media_ids(IG) == ["111111111", "222222222", "333333333"])
+    ok &= check("X sigue sacando el id del PATH",
+                R._media_ids("https://pbs.twimg.com/media/HNoYYPpXUAA8b26.jpg"
+                             ":large") == ["HNoYYPpXUAA8b26"])
+    ok &= check("un valor corto del query no es un id (width=640)",
+                R._query_ids("https://x.com/a/?width=640&h=480") == [])
+
     print("\n=== X. que lo aprendido SOBREVIVA al reinicio ===")
     # Las memorias de puertas eran dicts en RAM: se vaciaban en cada
     # `reload-cauce.sh`, asi que el sistema desaprendia cada vez que el usuario

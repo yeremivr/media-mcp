@@ -1178,7 +1178,18 @@ def image_identity(url: str) -> str:
     # foto_1280w.jpg, foto-thumb.jpg) para que las variantes converjan.
     stem = re.sub(r"(?i)[-_](?:\d{2,4}x\d{2,4}|\d{3,4}w|thumb(?:nail)?|small|"
                   r"medium|large|orig(?:inal)?)(?=\.|$)", "", base)
-    return f"b:{(p.hostname or '').lower()}:{stem.lower()}" if stem else f"u:{url}"
+    if stem:
+        return f"b:{(p.hostname or '').lower()}:{stem.lower()}"
+
+    # La ruta no identifica nada (Facebook: todas las fotos cuelgan del mismo
+    # `/lookaside/crawler/media/`). El identificador esta en el query. Sin
+    # esto caiamos en `u:<url entera>`, que "funciona" de casualidad mientras
+    # cada foto tenga una sola version: en cuanto la plataforma sirva la MISMA
+    # foto con otro parametro (`&width=`), la contaria dos veces.
+    qids = _query_ids(url)
+    if qids:
+        return f"q:{(p.hostname or '').lower()}:{max(qids, key=len)}"
+    return f"u:{url}"
 
 
 def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
@@ -1320,10 +1331,44 @@ def _family_tokens(url: str) -> frozenset:
     return frozenset(out)
 
 
+def _query_ids(url: str) -> list:
+    """Identificadores que viajan en el QUERY en vez de en la ruta.
+
+    El motor daba por supuesto que la identidad de un medio vive en el path.
+    Facebook no: sirve TODAS sus fotos desde el mismo path
+    `/lookaside/crawler/media/` y distingue por `?media_id=...`. Con esa
+    suposicion, `_media_ids` devolvia [] y el ancla quedaba CIEGA — le daba
+    identica afinidad (0.25) a la foto del post y a la basura de otro post,
+    asi que nada alcanzaba el umbral y `keep_authoritative` caia al escalon
+    "no hay autoridad, conservo todo". De ahi salio un post de UNA foto
+    reportado como carrusel de NUEVE.
+
+    Se descartan los valores cortos (`width=640`): un identificador global no
+    tiene 3 digitos."""
+    out = []
+    for part in urlparse(url).query.split("&"):
+        if "=" not in part:
+            continue
+        val = part.split("=", 1)[1]
+        if len(val) >= 8 and val.isalnum():
+            out.append(val)
+    return out
+
+
 def _media_ids(url: str) -> list:
-    """Tokens largos del basename que parecen identificadores."""
+    """Tokens largos que parecen identificadores.
+
+    Se mira PRIMERO el basename de la ruta y solo se cae al query si la ruta
+    no dice nada. El orden importa y es deliberado: Instagram y compania
+    llevan en el query tokens de FIRMA (`_nc_ohc`, `oh`, `oe`) que son
+    aleatorios por URL, no identidad. Si se mezclaran siempre, dos fotos sin
+    relacion podrian compartir prefijo por casualidad y el parentesco de ID
+    —que es el rasgo mas fuerte del ancla— se volveria ruidoso. Consultando
+    el query SOLO cuando la ruta calla, las plataformas cuyo path ya
+    identifica el medio se quedan exactamente como estaban."""
     base = urlparse(url).path.rsplit("/", 1)[-1]
-    return [t for t in re.split(r"[^A-Za-z0-9]+", base) if len(t) >= 8]
+    ids = [t for t in re.split(r"[^A-Za-z0-9]+", base) if len(t) >= 8]
+    return ids if ids else _query_ids(url)
 
 
 def _common_prefix_len(a: str, b: str) -> int:

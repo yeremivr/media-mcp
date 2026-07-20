@@ -980,7 +980,12 @@ def _curate_resolver(info: dict) -> dict:
                            if f.get("_cauce_path") else ()
                            for f in fmts_in])
     n_elems = len(set(e for e in elems if e))
+    # Los subtitulos NO son un medio reproducible. LinkedIn sirve su pista
+    # webvtt junto al video y se colaba en la galeria como "unknown_video".
+    SUBS = ("vtt", "srt", "ttml", "dfxp", "sbv", "ass", "sub")
     for f, elem in zip(fmts_in, elems):
+        if str(f.get("ext") or "").lower() in SUBS:
+            continue
         muxed = f.get("_cauce_muxed", True)
         h = f.get("height") or 0
         tbr = f.get("tbr")
@@ -1207,8 +1212,21 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
         res["title"] = res.get("title") or curated.get("title")
         res["full_caption"] = curated.get("full_caption")
         res["uploader"] = curated.get("uploader")
-        vids = [f for f in (curated.get("formats") or [])
-                if f.get("kind") == "video"]
+        # UN TRABAJO POR ELEMENTO, NO POR FORMATO. Regresion detectada en vivo
+        # con LinkedIn: 720p y 640p son el MISMO video en dos calidades, y se
+        # bajaban los dos. Confundir "formato" con "elemento" es exactamente
+        # la distincion que este motor existe para hacer. Los formatos ya
+        # vienen de mayor a menor calidad, asi que el primero de cada elemento
+        # es el mejor.
+        mejor: dict = {}
+        for f in (curated.get("formats") or []):
+            if f.get("kind") != "video":
+                continue
+            partes = str(f.get("format_id", "")).split("-")
+            elem = (partes[1][1:] if len(partes) >= 3 and partes[1][:1] == "v"
+                    and partes[1][1:].isdigit() else "0")
+            mejor.setdefault(elem, f)
+        vids = list(mejor.values())
         if not vids:
             res["media_type"] = curated.get("media_type")
             return res

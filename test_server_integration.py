@@ -300,6 +300,36 @@ def main():
                 {f["format_id"] for f in uno["formats"]}
                 == {"cauce-v-1080", "cauce-v-360"})
 
+    # REGRESION REAL (LinkedIn): un post con UN video en dos calidades dejaba
+    # DOS mp4 en la galeria, mas la pista de subtitulos como "unknown_video".
+    # `grab` lanzaba un trabajo por FORMATO cuando debe lanzarlo por ELEMENTO.
+    li = server2._curate_resolver({"formats": [
+        {"_cauce_muxed": True, "height": 720, "ext": "mp4"},
+        {"_cauce_muxed": True, "height": 640, "ext": "mp4"},
+        {"_cauce_muxed": True, "height": None, "ext": "vtt"},   # subtitulos
+    ]})
+    ok &= check("los subtitulos no entran como video",
+                all(f.get("format_id") != "cauce-v-0" for f in li["formats"]))
+
+    def _trabajos(curado):
+        """Lo que `grab` lanzaria: el mejor formato de CADA elemento."""
+        mejor = {}
+        for f in curado["formats"]:
+            if f["kind"] != "video":
+                continue
+            p = str(f["format_id"]).split("-")
+            e = (p[1][1:] if len(p) >= 3 and p[1][:1] == "v"
+                 and p[1][1:].isdigit() else "0")
+            mejor.setdefault(e, f)
+        return list(mejor.values())
+
+    t_li = _trabajos(li)
+    ok &= check("un video en 2 calidades = UN trabajo (no dos)", len(t_li) == 1)
+    ok &= check("y se queda con la mejor calidad",
+                t_li and t_li[0]["format_id"] == "cauce-v-720")
+    ok &= check("pero un carrusel de 5 videos sigue lanzando 5",
+                len(_trabajos(cur)) == 5)
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

@@ -1515,7 +1515,8 @@ def _same_item(p1: tuple, p2: tuple) -> bool:
 
 
 def drop_video_posters(images: list[MediaCandidate],
-                       videos: list[MediaCandidate]) -> list[MediaCandidate]:
+                       videos: list[MediaCandidate],
+                       anchor: str | None = None) -> list[MediaCandidate]:
     """Quita de las FOTOS las que en realidad son la caratula de un video.
 
     Verificado en vivo con un post de Instagram de 2 fotos y 5 videos: se
@@ -1530,8 +1531,30 @@ def drop_video_posters(images: list[MediaCandidate],
     delata es la ESTRUCTURA: cuelga del mismo elemento que un video."""
     if not videos or not images:
         return images
-    return [im for im in images
-            if not any(_same_item(im.path, v.path) for v in videos if v.path)]
+    quedan = [im for im in images
+              if not any(_same_item(im.path, v.path) for v in videos if v.path)]
+
+    # RED DE SEGURIDAD para plataformas SIN rastro de posicion. LinkedIn sirve
+    # el video en un `<video data-sources>` del DOM: no hay arbol JSON que
+    # recorrer, los caminos vienen vacios y el emparejamiento por elemento no
+    # puede funcionar. Resultado visto en vivo: la portada del video se
+    # guardaba en la galeria como si fuera una foto del post.
+    #
+    # Ahi vuelve a servir el ancla: en un post que ES un video, el `og:image`
+    # es su portada por contrato — es la miniatura que se ve al pegar el link
+    # en cualquier chat. Si hay video y una imagen que ES el ancla, es la
+    # caratula, no contenido.
+    #
+    # Solo se aplica si el paso por posicion no descarto NADA: donde si hay
+    # estructura (Instagram) manda la estructura, que es mas fiable. El riesgo
+    # asumido es un post con foto Y video donde el og:image sea la foto: se
+    # perderia esa foto. En todas las plataformas verificadas el og:image de
+    # un post con video es la portada, asi que se prefiere ese error al de
+    # ensuciar la galeria en todos los videos de LinkedIn y Facebook.
+    if anchor and len(quedan) == len(images):
+        aid = image_identity(anchor)
+        quedan = [im for im in quedan if image_identity(im.url) != aid]
+    return quedan
 
 
 def _prov_slot(c: MediaCandidate) -> str:
@@ -2158,7 +2181,7 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         drop_video_posters(
             keep_authoritative([c for c in img_scored
                                 if c.score >= MIN_IMAGE_SCORE], anchor=anchor),
-            media))
+            media, anchor=anchor))
 
     meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.

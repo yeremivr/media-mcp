@@ -1499,7 +1499,17 @@ def _same_item(p1: tuple, p2: tuple) -> bool:
     lo que esta POR ENCIMA de esa ultima lista identifica QUE medio es; la
     ultima solo dice EN QUE CALIDAD. Por eso se descarta antes de comparar.
     """
+    if not p1 or not p2:
+        return False                 # sin rastro no se puede afirmar nada
     c1, c2 = _coords(p1)[:-1], _coords(p2)[:-1]
+    if not c1 and not c2:
+        # Los DOS estan en la raiz de la estructura. Capturado en vivo con
+        # LinkedIn, que sirve las calidades como una lista de primer nivel:
+        #     "#0/src"  "#1/src"  "thumbnailUrl"
+        # El indice va delante, sin contenedor que lo nombre, asi que no hay
+        # coordenadas que comparar. Antes esto devolvia False y cada calidad
+        # se tomaba por un video distinto: "Video 1 de 3".
+        return True
     if not c1 or not c2:
         return False
     por_clave: dict = {}

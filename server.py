@@ -982,9 +982,18 @@ def _curate_resolver(info: dict) -> dict:
     n_elems = len(set(e for e in elems if e))
     # Los subtitulos NO son un medio reproducible. LinkedIn sirve su pista
     # webvtt junto al video y se colaba en la galeria como "unknown_video".
+    # Filtrar por EXTENSION no basta: LinkedIn sirve su pista en
+    # `.../video-captions-webvtt/...`, sin extension en la URL. Se miran
+    # tambien la URL y la procedencia. Los terminos son de ESTANDARES
+    # (webvtt, srt, el <track> de HTML, `caption` de schema.org), no jerga de
+    # ninguna plataforma: un subtitulo se llama igual en todas partes.
     SUBS = ("vtt", "srt", "ttml", "dfxp", "sbv", "ass", "sub")
+    SUB_HINT = re.compile(r"webvtt|captions?|subtitle|/track/", re.I)
     for f, elem in zip(fmts_in, elems):
         if str(f.get("ext") or "").lower() in SUBS:
+            continue
+        if SUB_HINT.search(str(f.get("url") or "")) or \
+           SUB_HINT.search(str(f.get("_cauce_provenance") or "")):
             continue
         muxed = f.get("_cauce_muxed", True)
         h = f.get("height") or 0

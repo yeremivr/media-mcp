@@ -908,6 +908,7 @@ WI = {
     "og_image": 14.0,            # vino de og:image / twitter:image
     # castigos
     "avatar_like": -80.0,        # avatar/profile/logo/icon/sprite/emoji/badge
+    "other_content": -70.0,      # recomendados/timeline/relacionados: OTRO post
     "static_asset": -70.0,       # assets de la interfaz, no contenido
     "tiny_dims": -60.0,          # <200px de lado -> es un adorno
     "vector_or_ico": -80.0,      # .svg/.ico jamas son la foto del post
@@ -927,9 +928,25 @@ IMAGE_KEY_LEXICON = (
 )
 
 # Ancestros que gritan "esto es un carrusel / album / galeria".
+# OJO con lo que NO esta aqui: `edges` e `items` se quitaron tras verlo fallar
+# EN VIVO. Son las palabras que usa CUALQUIER conexion GraphQL, incluido el
+# timeline del perfil (`polaris_ordered_timeline_connection/edges/node`), asi
+# que le regalaban +26 a las miniaturas de OTRAS publicaciones de la cuenta y
+# se colaban en el carrusel. Un token generico no es una senal.
 ANCESTOR_CAROUSEL_HINT = (
-    "sidecar", "carousel", "slide", "children", "edges", "gallery", "album",
-    "images", "photos", "attachments", "subattachments", "resources", "items",
+    "sidecar", "carousel", "slide", "children", "gallery", "album",
+    "images", "photos", "attachments", "subattachments", "resources",
+)
+
+# Ancestros que delatan contenido que NO es el del post: recomendados,
+# relacionados, el timeline del perfil, exploradores. Vienen del mismo CDN,
+# con la misma pinta y el mismo puntaje que las fotos buenas; lo unico que los
+# distingue es DE DONDE cuelgan en el documento. Descubierto en vivo: un post
+# de 11 fotos devolvia 22 (11 reales + 11 de otras publicaciones del autor).
+ANCESTOR_OTHER_CONTENT = (
+    "timeline", "related", "suggested", "recommend", "explore", "discover",
+    "similar", "more_from", "also_from", "seo_", "sidebar", "reels_tray",
+    "stories_tray", "profile_grid", "shortcode_media_preview",
 )
 
 # Rutas de CDN que son ASSET DE INTERFAZ, no contenido del post.
@@ -959,14 +976,27 @@ _FULLSIZE_HINT = re.compile(r"(?i)/(originals?|orig|full|source|raw|master)/")
 _FULLSIZE_PX = 100000     # sentinela: "mas grande que cualquier rendition"
 
 
+# Instagram NO pone el tamano en la ruta sino dentro del parametro `stp`:
+#   ?stp=c288.0.864.864a_dst-jpg_e35_s640x640_tt6
+# Visto en vivo: por mirar solo la ruta, TODAS las fotos de un carrusel real
+# salian sin dimensiones, y sin dimensiones no se puede elegir la version
+# grande ni confiar en el resultado.
+_STP_SIZE = re.compile(r"(?i)[_.&]([sp])(\d{2,4})x(\d{2,4})(?:[_.&]|$)")
+
+
 def _path_size(url: str) -> tuple[int | None, int | None]:
-    """Tamano (ancho, alto) que el CDN codifica en la propia ruta. Es la senal
-    mas barata y sorprendentemente fiable para separar foto de adorno."""
-    path = urlparse(url).path
+    """Tamano (ancho, alto) que el CDN codifica en la ruta o en el query. Es la
+    senal mas barata y sorprendentemente fiable para separar foto de adorno."""
+    parsed = urlparse(url)
+    path = parsed.path
     if _FULLSIZE_HINT.search(path):
         return _FULLSIZE_PX, _FULLSIZE_PX
     m = _PATH_SIZE.search(path)
     if not m:
+        # Fallback al query (Instagram/Facebook lo esconden en `stp`).
+        q = _STP_SIZE.search(parsed.query)
+        if q:
+            return _int_or_none(q.group(2)), _int_or_none(q.group(3))
         return None, None
     if m.group(1) and m.group(2):
         return _int_or_none(m.group(1)), _int_or_none(m.group(2))
@@ -1089,6 +1119,13 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
         s += WI["ancestor_carousel"]; feats.append("carousel")
     elif any(tok in anc_l for tok in ANCESTOR_IMAGE_HINT):
         s += WI["ancestor_image"]; feats.append("anc_img")
+
+    # ...pero si cuelga de un contenedor de OTRO contenido (timeline del
+    # perfil, recomendados, relacionados), no es del post aunque venga del
+    # mismo CDN y tenga la misma pinta. Se aplica SIEMPRE, incluso si ya cobro
+    # el bono de carrusel: `carousel_bumper` o similares deben quedar en rojo.
+    if any(tok in anc_l for tok in ANCESTOR_OTHER_CONTENT):
+        s += WI["other_content"]; feats.append("other")
 
     if rc.is_img:
         frm = (rc.dom_attrs or {}).get("from", "")

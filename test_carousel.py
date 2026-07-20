@@ -139,6 +139,41 @@ IG_LOGIN_WALL = r"""
 """
 
 
+# ==========================================================================
+# FIXTURE E — CARRUSEL REAL de Instagram servido a Googlebot (capturado EN
+# VIVO 2026-07-20, post /p/DaLBFzfD_yO/).
+# La pagina trae DOS grupos de fotos del MISMO CDN, con la misma pinta:
+#   (a) `carousel_media/image_versions2/candidates` -> las del post. SI.
+#   (b) `polaris_ordered_timeline_connection/edges/node` -> el timeline del
+#       perfil, o sea OTRAS publicaciones del autor. NO.
+# Ambos empataban en 114 puntos porque `edges` estaba en el lexico de carrusel,
+# y un post de 2 fotos devolvia 4. Lo unico que los distingue es DE DONDE
+# cuelgan. Ademas el tamano viaja en `stp=`, no en la ruta.
+# ==========================================================================
+IG_CAROUSEL_REAL = r"""
+<!DOCTYPE html><html><head>
+<meta property="og:title" content="u^day on Instagram: &quot;Cosmic Love&quot;">
+<meta property="og:description" content="oni. In Japanese folklore, you do not meet an oni. You become one.">
+</head><body>
+<script type="application/json">
+{"data":{"xdt_api__v1__media__shortcode__web_info":{"items":[{
+  "carousel_media":[
+    {"image_versions2":{"candidates":[
+      {"url":"https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/731390847_17933210073324584_1_n.jpg?stp=dst-jpg_e35_s640x640_tt6&_nc_cat=1&oh=AA"},
+      {"url":"https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/731390847_17933210073324584_1_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&_nc_cat=1&oh=AA"}]}},
+    {"image_versions2":{"candidates":[
+      {"url":"https://instagram.flim28-2.fna.fbcdn.net/v/t51.82787-15/731068186_17933210082324584_2_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&_nc_cat=1&oh=BB"}]}}
+  ]}]}},
+ "polaris_ordered_timeline_connection":{"edges":[
+   {"node":{"display_uri":"https://scontent.cdninstagram.com/v/t51.82787-15/624067917_17908796574324584_9_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=CC"}},
+   {"node":{"display_uri":"https://scontent.cdninstagram.com/v/t51.82787-15/610795174_17906543370324584_8_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=DD"}},
+   {"node":{"display_uri":"https://scontent.cdninstagram.com/v/t51.82787-15/619519690_17907793551324584_7_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=EE"}}
+ ]}}
+</script>
+</body></html>
+"""
+
+
 def main():
     ok = True
 
@@ -338,6 +373,27 @@ def main():
     print("\n=== M. Tope de formatos (diagnostico legible) ===")
     ok &= check("MAX_FORMATS existe y es razonable",
                 1 < R.MAX_FORMATS <= 30)
+
+    print("\n=== N. REGRESION EN VIVO: carrusel real vs timeline del perfil ===")
+    n = R.resolve_html(IG_CAROUSEL_REAL, "https://www.instagram.com/p/DaLBFzfD_yO/")
+    for i, c in enumerate(n.images, 1):
+        print(f"    {i}. [{c.score:6.1f}] {c.width}x{c.height} {c.url[:70]}")
+        print(f"        {c.provenance}")
+    ok &= check("SOLO las 2 del carrusel (descarta las 3 del timeline)",
+                len(n.images) == 2)
+    ok &= check("NINGUNA viene del timeline del perfil",
+                not any("timeline" in c.provenance for c in n.images))
+    ok &= check("todas salen de carousel_media",
+                all("carousel_media" in c.provenance for c in n.images))
+    ok &= check("fusiono los 2 tamanos de la foto 1 y eligio p1080x1080",
+                n.images and "p1080x1080" in n.images[0].url)
+    ok &= check("AHORA si conoce las dimensiones (las lee de stp=)",
+                all(c.width and c.height for c in n.images))
+    ok &= check("dimensiones correctas (1080x1080)",
+                n.images[0].width == 1080 and n.images[0].height == 1080)
+    ok &= check("media_type = carousel", n.media_type == "carousel")
+    ok &= check("con dimensiones conocidas la confianza YA no tiene techo",
+                n.confidence > R.WEAK_CONFIDENCE)
 
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())

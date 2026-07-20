@@ -174,6 +174,40 @@ IG_CAROUSEL_REAL = r"""
 """
 
 
+# ==========================================================================
+# FIXTURE F — POST REAL de Instagram con la cuadricula del perfil mezclada
+# (capturado EN VIVO 2026-07-20, post /p/Da6GnH8HGW4/).
+# Un post de 3 fotos devolvia 12:
+#   (a) 3 en `carousel_media/image_versions2/candidates` -> las del post.
+#   (b) 9 en <img src> sueltos -> la cuadricula del perfil. Mismo CDN, mismas
+#       firmas, 640x640, 116 puntos: por rasgos propios son iguales a una foto
+#       buena. Solo la ESTRUCTURA las distingue.
+# Ademas el og:title trae 'Autor on Instagram: "caption"' (de ahi el autor y
+# el caption REAL), mientras que el JSON de la pagina incluye el texto de OTRA
+# publicacion mas largo — que con la regla vieja ("el mas largo gana") ganaba.
+# ==========================================================================
+IG_GRID_MIXED = r"""
+<!DOCTYPE html><html><head>
+<meta property="og:title" content='Not Journal on Instagram: "Um jovem decidiu ignorar as vagas tradicionais e se candidatar ao cargo mais importante da OpenAI."'>
+</head><body>
+<img src="https://scontent.cdninstagram.com/v/t51.82787-15/543756751_17898130368276987_1_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=AA">
+<img src="https://scontent.cdninstagram.com/v/t51.71878-15/752762000_1348476560762617_2_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=BB">
+<img src="https://scontent.cdninstagram.com/v/t51.82787-15/752230107_17868021615633483_3_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=CC">
+<script type="application/json">
+{"items":[{"carousel_media":[
+  {"image_versions2":{"candidates":[
+    {"url":"https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/750755233_17938923786276987_9_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&oh=DD"}]}},
+  {"image_versions2":{"candidates":[
+    {"url":"https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/749542545_17938923798276987_8_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&oh=EE"}]}},
+  {"image_versions2":{"candidates":[
+    {"url":"https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/750829478_17938923765276987_7_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&oh=FF"}]}}
+]}],
+ "otro_post":{"caption":"A Espanha e bicampea mundial. Depois de controlar a final por quase toda a noite, a selecao espanhola venceu a Argentina por 1 a 0 na prorrogacao e voltou ao topo do futebol 16 anos depois. O gol saiu aos 106 minutos e o titulo confirma a reconstrucao de uma selecao. Siga @notsports.ai"}}
+</script>
+</body></html>
+"""
+
+
 def main():
     ok = True
 
@@ -394,6 +428,34 @@ def main():
     ok &= check("media_type = carousel", n.media_type == "carousel")
     ok &= check("con dimensiones conocidas la confianza YA no tiene techo",
                 n.confidence > R.WEAK_CONFIDENCE)
+
+    print("\n=== O. REGRESION EN VIVO: cuadricula del perfil + caption ajeno ===")
+    o = R.resolve_html(IG_GRID_MIXED, "https://www.instagram.com/p/Da6GnH8HGW4/")
+    for i, c in enumerate(o.images, 1):
+        print(f"    {i}. [{c.score:6.1f}] {c.width}x{c.height} "
+              f"cont={c.from_container} {c.url[:62]}")
+    ok &= check("SOLO las 3 del contenedor (descarta los 3 <img> sueltos)",
+                len(o.images) == 3)
+    ok &= check("todas vienen del contenedor estructurado",
+                all(c.from_container for c in o.images))
+    ok &= check("ninguna es de 640x640 (esas eran la cuadricula)",
+                all(c.width == 1080 for c in o.images))
+    ok &= check("EL CAPTION ES EL DE ESTE POST, no el mas largo del documento",
+                o.full_caption and "OpenAI" in o.full_caption)
+    ok &= check("NO se cuela el caption del otro post (el del Mundial)",
+                o.full_caption and "Espanha" not in o.full_caption)
+    ok &= check("saca el AUTOR del og:title (antes llegaba null)",
+                o.uploader == "Not Journal")
+    ok &= check("el titulo ya no arrastra la envoltura 'on Instagram:'",
+                o.title and "on Instagram" not in o.title)
+
+    print("\n=== P. keep_authoritative: sin contenedor NO filtra nada ===")
+    # Pinterest/blogs no tienen contenedor: ahi no hay autoridad a la que
+    # deferir y hay que conservar todo.
+    p = R.resolve_html(PINTEREST_PIN, "https://www.pinterest.com/pin/12345/")
+    ok &= check("Pinterest sigue devolviendo su foto", len(p.images) == 1)
+    ok &= check("y sigue siendo la 'originals'",
+                "originals" in p.images[0].url)
 
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())

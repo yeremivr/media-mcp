@@ -710,6 +710,11 @@ class MediaCandidate:
     mime: str | None = None
     provenance: str = ""           # de donde salio (para depurar / transparencia)
     order: int = 0                 # posicion en el documento (orden del carrusel)
+    # True si salio de un CONTENEDOR ESTRUCTURADO de medios del post
+    # (carousel_media, edge_sidecar_to_children, image_versions...). Ver
+    # `keep_authoritative()`: si el documento tiene contenedor, manda el
+    # contenedor y los <img> sueltos de la pagina se descartan.
+    from_container: bool = False
 
     @property
     def identity(self) -> str:
@@ -1153,7 +1158,29 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
 
     prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
     return MediaCandidate(full, round(s, 1), "image", eff_h, eff_w, None,
-                          ext, None, prov, order=rc.order)
+                          ext, None, prov, order=rc.order,
+                          from_container=("carousel" in feats))
+
+
+def keep_authoritative(cands: list[MediaCandidate]) -> list[MediaCandidate]:
+    """SI la pagina trae un CONTENEDOR ESTRUCTURADO de medios, ese contenedor
+    ES la autoridad y todo lo demas sobra.
+
+    Descubierto EN VIVO: un post de 3 fotos devolvia 12. Las 3 reales colgaban
+    de `carousel_media/image_versions2/candidates`; las otras 9 eran <img>
+    sueltos del HTML — la cuadricula del perfil. Mismo CDN, firmadas, 640x640,
+    116 puntos: por rasgos propios son indistinguibles de una foto buena.
+
+    Lo que SI las distingue es estructural: Instagram (y Facebook, y LinkedIn)
+    declaran los medios DEL POST dentro de un contenedor con nombre, y ese
+    contenedor esta COMPLETO. Un <img> suelto en el documento es mobiliario de
+    la pagina: cuadricula, sugeridos, publicaciones relacionadas.
+
+    Regla: si ALGUN candidato vino de contenedor, se conservan solo esos. Si
+    NINGUNO vino de contenedor (Pinterest, blogs, HTML plano), no hay autoridad
+    a la que deferir y se conservan todos."""
+    from_container = [c for c in cands if c.from_container]
+    return from_container if from_container else cands
 
 
 def group_images(cands: list[MediaCandidate]) -> list[MediaCandidate]:
@@ -1336,6 +1363,34 @@ def _clean_caption(t) -> str | None:
     return t[:4000]
 
 
+# Las redes envuelven el caption dentro del og:title con un prefijo de autor:
+#   'Not Journal on Instagram: "Um jovem decidiu ignorar as vagas..."'
+# De ahi salen DOS datos: el AUTOR (que hoy llegaba null) y el caption REAL de
+# ESTA publicacion — que es justo el que hay que preferir sobre cualquier otro
+# texto largo del documento.
+_OG_TITLE_WRAPPER = re.compile(
+    r'(?is)^\s*(.{1,80}?)\s+on\s+(?:instagram|facebook|threads|linkedin)\s*:\s*'
+    r'[\"“”](.*?)[\"“”]\s*$')
+
+
+def unwrap_og_title(t) -> tuple[str | None, str | None]:
+    """De 'Autor on Instagram: "texto"' saca (autor, texto). Si no cuadra el
+    patron, devuelve (None, el texto tal cual)."""
+    if not isinstance(t, str):
+        return None, None
+    m = _OG_TITLE_WRAPPER.match(t.strip())
+    if m:
+        return m.group(1).strip() or None, m.group(2).strip() or None
+    return None, t
+
+
+def _caption_key(t: str) -> str:
+    """Firma normalizada para decidir si dos textos son EL MISMO caption (uno
+    quiza truncado). Solo letras/numeros en minuscula: inmune a comillas
+    tipograficas, saltos de linea y espacios raros."""
+    return re.sub(r"[^0-9a-zà-ɏ]+", "", (t or "").lower())[:120]
+
+
 def find_caption(metas: dict, json_trees: list) -> str | None:
     """IMPLEMENTACION 1 (la del TXT): el CAPTION COMPLETO del post.
 
@@ -1344,14 +1399,31 @@ def find_caption(metas: dict, json_trees: list) -> str | None:
     el JSON embebido. Lo buscamos en las dos fuentes y nos quedamos con el MAS
     LARGO que no sea relleno: mas largo = mas informacion para razonar.
 
-    Coste: CERO fetches extra. Ya bajamos ese HTML para buscar el video."""
-    cands: list[str] = []
+    Coste: CERO fetches extra. Ya bajamos ese HTML para buscar el video.
 
-    for k in ("og:description", "twitter:description", "description",
-              "og:title", "twitter:title", "<title>"):
+    OJO CON "EL MAS LARGO GANA": era la regla original y fallo EN VIVO. La
+    pagina de un post trae TAMBIEN el texto de otras publicaciones (la
+    cuadricula del perfil, relacionados). En un post sobre OpenAI, el motor
+    devolvio como caption la cronica de una final del Mundial de OTRA cuenta,
+    simplemente porque era mas larga.
+
+    Regla corregida, por AUTORIDAD: las meta-etiquetas describen ESTA pagina,
+    asi que mandan. Un texto del JSON solo puede reemplazarlas si es el MISMO
+    caption sin truncar (comparten firma normalizada) — que es el caso util:
+    og:description suele venir cortado y el JSON trae el texto completo."""
+    meta_cands: list[str] = []
+    for k in ("og:description", "twitter:description", "description"):
         c = _clean_caption(metas.get(k))
         if c:
-            cands.append(c)
+            meta_cands.append(c)
+    # og:title suele traer el caption envuelto: 'Autor on Instagram: "..."'.
+    for k in ("og:title", "twitter:title", "<title>"):
+        _author, inner = unwrap_og_title(metas.get(k))
+        c = _clean_caption(inner)
+        if c:
+            meta_cands.append(c)
+
+    json_cands: list[str] = []
 
     def visit(node, depth=0):
         if depth > 30:
@@ -1361,7 +1433,7 @@ def find_caption(metas: dict, json_trees: list) -> str | None:
                 if isinstance(v, str) and str(k).lower() in CAPTION_KEYS:
                     c = _clean_caption(v)
                     if c:
-                        cands.append(c)
+                        json_cands.append(c)
                 else:
                     visit(v, depth + 1)
         elif isinstance(node, (list, tuple)):
@@ -1371,11 +1443,28 @@ def find_caption(metas: dict, json_trees: list) -> str | None:
     for tree in json_trees:
         visit(tree)
 
-    if not cands:
+    if meta_cands:
+        best = max(meta_cands, key=lambda c: (len(c), "\n" in c, "#" in c))
+        key = _caption_key(best)
+        # ¿Hay en el JSON una version MAS LARGA DEL MISMO texto? Esa gana.
+        # Un texto DISTINTO, por largo que sea, no: sera de otro post.
+        #
+        # Se comparan PREFIJOS, no contenido: og:description no siempre es un
+        # recorte literal del caption (a veces la plataforma lo abrevia y mueve
+        # los hashtags), asi que exigir que el largo CONTENGA al corto fallaba.
+        # Lo que si comparten es el ARRANQUE. 30 caracteres normalizados son
+        # de sobra especificos: dos posts distintos casi nunca empiezan igual.
+        if len(key) >= 24:
+            pref = key[:30]
+            extended = [c for c in json_cands
+                        if len(c) > len(best) and _caption_key(c).startswith(pref)]
+            if extended:
+                return max(extended, key=len)
+        return best
+
+    if not json_cands:
         return None
-    # El mas largo gana, pero con un desempate: preferimos el que trae saltos
-    # de linea o hashtags (senal de que es el texto del post y no un titulo).
-    return max(cands, key=lambda c: (len(c), "\n" in c, "#" in c))
+    return max(json_cands, key=lambda c: (len(c), "\n" in c, "#" in c))
 
 
 def extract_hashtags(text: str | None) -> list:
@@ -1432,8 +1521,20 @@ def _find_meta(dom_and_json, page_url) -> dict:
     # (Instagram, Pinterest, casi todo lo servido a un bot de vista previa) NO
     # traen JSON-LD pero SI traen og:*. Es informacion gratis que teniamos
     # delante y no estabamos leyendo.
-    meta["title"] = meta["title"] or metas.get("og:title") or \
-        metas.get("twitter:title") or metas.get("<title>")
+    # og:title de las redes viene envuelto: 'Autor on Instagram: "caption"'.
+    # De ahi salen el AUTOR y un titulo legible (la 1a linea del caption), en
+    # vez de volcar la envoltura entera como titulo.
+    raw_title = metas.get("og:title") or metas.get("twitter:title") or \
+        metas.get("<title>")
+    og_author, og_text = unwrap_og_title(raw_title)
+    if og_author and not meta["uploader"]:
+        meta["uploader"] = og_author
+    if not meta["title"]:
+        if og_text:
+            first = next((ln.strip() for ln in og_text.splitlines() if ln.strip()), "")
+            meta["title"] = (first[:120] or None) if first else (raw_title or None)
+        else:
+            meta["title"] = raw_title
     meta["thumbnail"] = meta["thumbnail"] or metas.get("og:image") or \
         metas.get("og:image:secure_url") or metas.get("twitter:image")
     if not meta["uploader"]:
@@ -1508,7 +1609,8 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         ic = score_image_candidate(rc, page_url)
         if ic is not None:
             img_scored.append(ic)
-    images = group_images([c for c in img_scored if c.score >= MIN_IMAGE_SCORE])
+    images = group_images(
+        keep_authoritative([c for c in img_scored if c.score >= MIN_IMAGE_SCORE]))
 
     meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.

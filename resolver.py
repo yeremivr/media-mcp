@@ -1085,6 +1085,13 @@ def image_identity(url: str) -> str:
     # vivo: un tuit con 1 imagen devolvia 2).
     base = re.sub(r":(?:orig|large|medium|small|thumb|\d+x\d+)$", "", base, flags=re.I)
 
+    # ...y ademas X sirve la MISMA foto con y sin extension en la ruta:
+    #   /media/HNoYYPpXUAA8b26.jpg:large      (extension + sufijo)
+    #   /media/HNoYYPpXUAA8b26?format=jpg     (sin extension, formato en query)
+    # Quitar la extension del identificador hace que converjan. De paso fusiona
+    # el mismo medio servido como .jpg y como .webp, que es lo deseable.
+    base = re.sub(r"\.(jpe?g|png|webp|gif|heic|bmp|avif)$", "", base, flags=re.I)
+
     host = (p.hostname or "").lower()
     if re.search(r"(?:fbcdn\.net|cdninstagram\.com)$", host):
         # En los CDN de Meta el basename ES el id del medio. Solo aplicamos
@@ -1365,6 +1372,15 @@ def group_images(cands: list[MediaCandidate]) -> list[MediaCandidate]:
         # entero se beneficia. Evita perder una foto porque la variante que
         # gano por tamano venia de una isla del HTML mas pobre en contexto.
         best.score = max(m.score for m in members)
+        # `_FULLSIZE_PX` es un CENTINELA para ordenar (/originals/, .jpg:large):
+        # significa "mas grande que cualquier otra version", no un tamano real.
+        # Si se deja puesto, sale a la interfaz como "Foto 1 · 100000x100000".
+        # Se cambia por el mayor tamano REAL conocido del grupo, y si ninguno
+        # se conoce, por None: no saberlo es la verdad, inventarlo no.
+        if (best.width or 0) >= _FULLSIZE_PX or (best.height or 0) >= _FULLSIZE_PX:
+            reales = [(m.width, m.height) for m in members
+                      if m.width and m.width < _FULLSIZE_PX]
+            best.width, best.height = (max(reales) if reales else (None, None))
         reps.append(best)
 
     reps.sort(key=lambda c: c.order)

@@ -586,8 +586,12 @@ def main():
         '<meta property="og:title" content=\'Marcelo Chepillo on X: "un meme" / X\'>'
         '<meta property="og:image" content="https://pbs.twimg.com/media/'
         'HNoYYPpXUAA8b26.jpg:large">'
-        '<img src="https://pbs.twimg.com/media/HNoYYPpXUAA8b26.jpg?name=small'
-        '&format=jpg">'
+        # OJO: la forma REAL de X (capturada en vivo) NO lleva extension en la
+        # ruta, el formato va en el query. La primera version de este fixture
+        # se la invento con `.jpg?name=small` y por eso el test PASABA mientras
+        # la realidad fallaba. Fixture inventado = test que miente.
+        '<img src="https://pbs.twimg.com/media/HNoYYPpXUAA8b26?format=jpg'
+        '&name=small" width="546" height="680">'
     )
     v = R.resolve_html(X_POST, "https://x.com/JRafela63855/status/2079001071393890584")
     for c in v.images:
@@ -597,9 +601,14 @@ def main():
     ok &= check("se queda con la version GRANDE (:large)",
                 v.images and ":large" in v.images[0].url)
     ok &= check("media_type = image, no carousel", v.media_type == "image")
-    ok &= check("identity ignora el sufijo :large",
+    ok &= check("identity ignora el sufijo :large Y la extension",
                 R.image_identity("https://pbs.twimg.com/media/ABC12345.jpg:large")
-                == R.image_identity("https://pbs.twimg.com/media/ABC12345.jpg"))
+                == R.image_identity("https://pbs.twimg.com/media/ABC12345?format=jpg"))
+    ok &= check("el centinela de tamano NO se filtra a la interfaz",
+                all((c.width or 0) < 100000 and (c.height or 0) < 100000
+                    for c in v.images))
+    ok &= check("reporta el tamano REAL conocido del grupo (546x680)",
+                v.images and v.images[0].width == 546 and v.images[0].height == 680)
     ok &= check("desenvuelve el og:title de X y su cola ' / X'",
                 v.uploader == "Marcelo Chepillo")
 

@@ -728,6 +728,60 @@ def main():
     ok &= check("un valor corto del query no es un id (width=640)",
                 R._query_ids("https://x.com/a/?width=640&h=480") == [])
 
+    print("\n=== Z. el ancla tambien VETA lo que el contenedor mete de mas ===")
+    # DATOS REALES capturados en vivo del post de Facebook que lo destapo
+    # (EnterCore, "Que fue xd"): UNA sola foto publicada, reportada como
+    # carrusel de NUEVE. Estas 9 URLs y sus dimensiones salieron tal cual de
+    # `resolve_media` contra el servidor del telefono.
+    #
+    # Lo importante: las NUEVE traian la marca de contenedor
+    # (`[key+dims+carousel]`), asi que `keep_authoritative` resolvia en el
+    # escalon 1 y no llegaba a consultar el ancla NUNCA. En Instagram el
+    # contenedor acota de verdad; en Facebook `attachment/media` es un cajon
+    # de sastre donde cuelgan el post, los vecinos, el placeholder borroso y
+    # hasta el permalink de un video ajeno.
+    LK = "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id="
+
+    def _fb(u, w, h, s):
+        return R.MediaCandidate(url=u, score=s, kind="image", width=w,
+                                height=h, is_post_media=True)
+
+    ENTERCORE = [
+        _fb(LK + "1523758276433683", 512, 640, 76),    # EL MEME (= og:image)
+        _fb(LK + "1395159759095153", 225, 225, 56),    # post vecino
+        _fb(LK + "1029224036749977", 261, 163, 56),    # post vecino
+        _fb(LK + "27531537473140125", 168, 209, 56),   # post vecino
+        _fb("https://scontent.flim38-1.fna.fbcdn.net/v/t15.5256-10/"
+            "752576154_1046134134732361_217287752.jpg", 960, 960, 134),
+        _fb("https://www.facebook.com/61585103860771/videos/"
+            "1334593682178915/", 576, 1024, 76),       # permalink de VIDEO
+        _fb(LK + "1334593682178915", 576, 1024, 76),   # miniatura de ese video
+        _fb(LK + "1078546248176237", 128, 225, 56),    # post vecino
+        _fb(LK + "2919417081754717", 261, 224, 56),    # post vecino
+    ]
+    kept = R.keep_authoritative(ENTERCORE, LK + "1523758276433683")
+    ok &= check("un post de UNA foto devuelve UNA foto (antes: nueve)",
+                len(kept) == 1)
+    ok &= check("y la que queda es el medio del post, no el mas puntuado "
+                "(el borroso puntuaba 134 y sobra)",
+                kept and kept[0].url.endswith("1523758276433683"))
+
+    # NO ROMPER el carrusel de verdad: mismas URLs reales del post de 5 fotos
+    # verificado en vivo (5/5 descargadas). Sus media_id se acunaron juntos,
+    # asi que comparten prefijo y el ancla los reconoce como hermanos.
+    CINCO = [_fb(LK + i, 1080, 1080, 76) for i in
+             ("122141642061152120", "122141642073152120", "122141642085152120",
+              "122141642067152120", "122141642079152120")]
+    ok &= check("un carrusel real de 5 sigue devolviendo 5",
+                len(R.keep_authoritative(CINCO, LK + "122141642061152120")) == 5)
+
+    # Red de seguridad: si el ancla no se parece a NADA del contenedor (puede
+    # ser de otra naturaleza, p.ej. la portada de un video frente a sus
+    # pistas), NO nos quedamos sin nada: manda el contenedor, como siempre.
+    ok &= check("si el ancla no casa con nada, el contenedor sigue mandando",
+                len(R.keep_authoritative(
+                    CINCO, "https://otrositio.com/imagen-sin-relacion.jpg")) == 5)
+
     print("\n=== X. que lo aprendido SOBREVIVA al reinicio ===")
     # Las memorias de puertas eran dicts en RAM: se vaciaban en cada
     # `reload-cauce.sh`, asi que el sistema desaprendia cada vez que el usuario

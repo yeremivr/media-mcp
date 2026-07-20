@@ -1451,6 +1451,31 @@ def keep_authoritative(cands: list[MediaCandidate],
          se conserva todo (Pinterest, blogs, HTML plano)."""
     authoritative = [c for c in cands if c.is_post_media]
     if authoritative:
+        # EL ANCLA TAMBIEN VETA, no solo suple.
+        #
+        # Descubierto en vivo con un post de Facebook de UNA foto que salio
+        # como carrusel de nueve. La suposicion rota era que "venir de un
+        # contenedor" garantiza pertenecer al post. En Instagram si:
+        # `carousel_media/image_versions2/candidates` contiene exactamente las
+        # fotos del post. En Facebook NO: bajo `attachment/media` cuelgan el
+        # medio del post, las miniaturas de los posts vecinos, el placeholder
+        # borroso y hasta el permalink de un video. El contenedor no acota
+        # nada, asi que devolver su contenido entero era devolver la pagina.
+        #
+        # Cuando ademas hay ancla tenemos DOS evidencias independientes: el
+        # contenedor dice "esto es un medio" y el ancla dice "esto pertenece a
+        # ESTE post". Cruzarlas es mas fuerte que cualquiera de las dos, y
+        # ninguna plataforma tiene que declarar nada nuevo para que funcione.
+        #
+        # Si la interseccion sale vacia NO nos quedamos sin nada: puede que el
+        # og:image sea de otra naturaleza que los medios del contenedor (una
+        # portada de video frente a las pistas, por ejemplo). En ese caso el
+        # contenedor sigue mandando, que es el comportamiento de siempre.
+        if anchor:
+            near = [c for c in authoritative
+                    if anchor_affinity(c.url, anchor) >= ANCHOR_MIN_AFFINITY]
+            if near:
+                return near
         return authoritative
 
     if anchor:

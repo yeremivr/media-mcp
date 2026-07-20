@@ -1089,7 +1089,18 @@ def list_formats(url: str) -> dict:
         info = _extract_info(url)
     except Exception as e:
         return _friendly_error(e)
+    return _listing_from_info(info, url)
 
+
+def _listing_from_info(info: dict, url: str) -> dict:
+    """Arma el listado a partir de una extraccion YA HECHA.
+
+    Estaba dentro de `list_formats`, y por eso `grab` no podia aprovechar la
+    suya: extraia con `_extract_info`, y si el que habia servido era yt-dlp
+    volvia a llamar a `list_formats(url)`, que EXTRAIA OTRA VEZ. En YouTube eso
+    es repetir la cascada de estrategias y el PO token enteros. Separar el
+    "extraer" del "presentar" hace que cada llamada pague una sola extraccion.
+    """
     # Si el resultado vino del resolver estructural, se cura aparte: sus
     # formatos ya son MUXED (video+audio juntos) -> NO se les agrega +bestaudio.
     if info.get("_cauce_resolver"):
@@ -1245,7 +1256,10 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
         return res
 
     # --- Caso VIDEO ---
-    listing = curated or list_formats(url)
+    # `_listing_from_info` en vez de `list_formats(url)`: la extraccion ya
+    # esta hecha arriba. Antes se re-extraia entera (en YouTube, la cascada de
+    # estrategias y el PO token otra vez) solo para volver a mirar lo mismo.
+    listing = curated or _listing_from_info(info, url)
     fmts = [f for f in (listing.get("formats") or []) if f.get("kind") == "video"]
     if not fmts:
         fmts = [f for f in (listing.get("formats") or []) if f.get("kind") == "audio"]

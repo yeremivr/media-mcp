@@ -612,6 +612,74 @@ def main():
     ok &= check("desenvuelve el og:title de X y su cola ' / X'",
                 v.uploader == "Marcelo Chepillo")
 
+    print("\n=== W. bajar el MEDIO: verificar bytes + cascada de puertas ===")
+    # Capturado EN VIVO con Facebook: la pagina se gana con Googlebot y las
+    # fotos vienen por `/lookaside/crawler/media/?media_id=...`, un endpoint
+    # que sirve el archivo a los CRAWLERS. Se pedia con UA de navegador -> el
+    # CDN devolvia su HTML de login con codigo 200 y se guardaba como .jpg.
+    # El job decia "1 foto guardada" y en la galeria quedaba basura: el
+    # sistema fallaba EN SILENCIO.
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 32
+    LOGIN_HTML = b"<!DOCTYPE html><html><body>Inicia sesion</body></html>"
+
+    ok &= check("sniff reconoce JPEG / PNG / WebP",
+                R.sniff_image_mime(JPEG) == "image/jpeg"
+                and R.sniff_image_mime(PNG) == "image/png"
+                and R.sniff_image_mime(WEBP) == "image/webp")
+    ok &= check("sniff RECHAZA el HTML del login-wall",
+                R.sniff_image_mime(LOGIN_HTML) is None)
+
+    tried: list = []
+
+    def fake_fetch(url, ua, *, max_bytes, referer=None):
+        """Solo las puertas de crawler reciben la imagen; el navegador se come
+        el login-wall, exactamente como hace Facebook."""
+        tried.append(R.ua_kind(ua))
+        return JPEG if R.ua_kind(ua) in ("facebookbot", "googlebot") else LOGIN_HTML
+
+    R._MEDIA_GATE_MEMORY.clear()
+    tried.clear()
+    got = R.fetch_image_bytes("https://lookaside.fbsbx.com/lookaside/crawler/"
+                              "media/?media_id=1221", fetch=fake_fetch)
+    ok &= check("NO devuelve el HTML disfrazado de imagen",
+                got is not None and got[0] == JPEG)
+    ok &= check("el mime sale de los BYTES, no de la cabecera",
+                got is not None and got[1] == "image/jpeg")
+    ok &= check("empieza por el navegador y cae a la puerta de crawler",
+                tried[0] == "browser" and "facebookbot" in tried)
+
+    # La memoria por-host: en un carrusel solo la 1a foto paga la busqueda.
+    tried.clear()
+    R.fetch_image_bytes("https://lookaside.fbsbx.com/lookaside/crawler/"
+                        "media/?media_id=9999", fetch=fake_fetch)
+    ok &= check("recuerda la puerta ganadora POR HOST (1 solo fetch)",
+                tried == ["facebookbot"])
+
+    # La pista del llamante: la puerta que abrio la PAGINA lidera.
+    R._MEDIA_GATE_MEMORY.clear()
+    tried.clear()
+    R.fetch_image_bytes("https://lookaside.fbsbx.com/x.jpg",
+                        prefer_gate="facebook:googlebot:original",
+                        fetch=fake_fetch)
+    ok &= check("prefer_gate acepta la cadena de estrategia completa",
+                tried == ["googlebot"])
+
+    # Un CDN sano no debe pagar ni un fetch de mas (sin regresion de latencia).
+    R._MEDIA_GATE_MEMORY.clear()
+    tried.clear()
+    R.fetch_image_bytes("https://scontent.cdninstagram.com/v/foto.jpg",
+                        fetch=lambda u, ua, **k: (tried.append(R.ua_kind(ua)), PNG)[1])
+    ok &= check("un CDN sano acierta al primer intento", tried == ["browser"])
+
+    # Si NINGUNA puerta da una imagen, falla HONESTAMENTE (None), no devuelve
+    # bytes que acabarian escritos como .jpg en la galeria del usuario.
+    R._MEDIA_GATE_MEMORY.clear()
+    ok &= check("si ninguna puerta sirve la imagen, devuelve None",
+                R.fetch_image_bytes("https://ejemplo.com/x.jpg",
+                                    fetch=lambda u, ua, **k: LOGIN_HTML) is None)
+
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())
     ok &= check("selftest_carousel() (fotos) OK", R.selftest_carousel())

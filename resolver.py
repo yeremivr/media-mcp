@@ -2125,27 +2125,123 @@ def selftest_carousel() -> bool:
         return False
 
 
-def fetch_image_bytes(url: str, *, referer: str | None = None,
-                      max_bytes: int = _MAX_IMAGE_BYTES) -> tuple[bytes, str] | None:
-    """Baja los BYTES de una imagen del CDN. Solo tiene sentido desde el
-    telefono (IP residencial que SI llega a fbcdn/licdn, que la red de Claude
-    tiene vetada). Devuelve (bytes, content_type) o None.
-
-    El `Referer` importa: varios CDN devuelven 403 sin el del sitio de origen."""
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": _BROWSER_UA,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            **({"Referer": referer} if referer else {}),
-        })
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
-            data = r.read(max_bytes)
-            ctype = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-        return (data, ctype) if data else None
-    except Exception:
+# --------------------------------------------------------------------------
+# LA FIRMA DEL ARCHIVO (verificar los bytes, no creerle a la cabecera)
+# --------------------------------------------------------------------------
+# El `Content-Type` es una DECLARACION del servidor, y los servidores mienten:
+# cuando Facebook no te deja pasar devuelve una pagina de "inicia sesion" con
+# codigo 200, y la guardabamos como .jpg. El job decia "1 foto guardada" y en
+# la galeria quedaba un archivo roto — el sistema fallaba EN SILENCIO, que es
+# la peor forma de fallar.
+#
+# Los primeros bytes de un archivo SON el formato: eso no lo puede falsear
+# nadie sin dejar de ser una imagen. Es el mismo criterio que el ancla —
+# apoyarse en un contrato que la plataforma no puede romper, en vez de en una
+# declaracion que esperamos que sea cierta.
+def sniff_image_mime(data: bytes) -> str | None:
+    """Devuelve el mime REAL segun los magic bytes, o None si no es imagen."""
+    if len(data) < 12:
         return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    # AVIF / HEIC: contenedor ISO-BMFF, la marca va en bytes 4..8.
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"mif1", b"msf1"):
+            return "image/heic"
+    return None
 
 
-def fetch_thumbnail_bytes(url: str, *, referer: str | None = None) -> tuple[bytes, str] | None:
+# LA MISMA CASCADA DE PUERTAS, AHORA PARA EL MEDIO.
+# Descubierto en vivo con Facebook: la pagina se gana con Googlebot y las
+# fotos vienen como `/lookaside/CRAWLER/media/?media_id=...` — un endpoint
+# que, por su propio nombre, sirve el archivo a los CRAWLERS. Lo pediamos con
+# UA de navegador, o sea con una credencial distinta de la que abrio la
+# puerta. La regla general, sin jerga de ningun sitio:
+#
+#     la puerta que abrio la pagina abre tambien el medio.
+#
+# Y como la verificacion de arriba nos dice si lo que llego es una imagen de
+# verdad, la cascada tiene realimentacion: si no lo es, prueba la siguiente
+# puerta. Igual que con el HTML, se recuerda la ganadora POR HOST de imagen,
+# asi que en un carrusel solo la 1a foto paga el coste de buscar.
+_MEDIA_GATES = (_BROWSER_UA, _FACEBOOKBOT_UA, _GOOGLEBOT_UA,
+                _TWITTERBOT_UA, _WHATSAPP_UA)
+
+_UA_BY_KIND = {kind: ua for ua, kind in _UA_KIND.items()}
+_MEDIA_GATE_MEMORY: dict = {}
+
+
+def _http_get_image(url: str, ua: str, *, max_bytes: int,
+                    referer: str | None) -> bytes:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ua,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        **({"Referer": referer} if referer else {}),
+    })
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+        return r.read(max_bytes)
+
+
+def fetch_image_bytes(url: str, *, referer: str | None = None,
+                      max_bytes: int = _MAX_IMAGE_BYTES,
+                      prefer_gate: str | None = None,
+                      fetch=_http_get_image) -> tuple[bytes, str] | None:
+    """Baja los BYTES de una imagen del CDN y VERIFICA que sean una imagen.
+
+    Solo tiene sentido desde el telefono (IP residencial que SI llega a
+    fbcdn/licdn, que la red de Claude tiene vetada). Devuelve (bytes, mime)
+    con el mime deducido de los propios bytes, o None si ninguna puerta
+    devolvio una imagen de verdad. Nunca devuelve HTML disfrazado.
+
+    `prefer_gate` acepta el nombre de una puerta ("googlebot") o la cadena de
+    estrategia completa que devuelve resolve() ("facebook:googlebot:original")
+    para liderar con la que ya abrio la pagina.
+
+    El `Referer` importa: varios CDN devuelven 403 sin el del sitio de origen.
+    """
+    host = urlparse(url).netloc.lower()
+
+    # Orden de puertas: la que pide el llamante, luego la que funciono la vez
+    # pasada en este host, luego el resto. Un CDN sano acierta a la primera y
+    # no gasta ni un fetch de mas.
+    hinted = None
+    if prefer_gate:
+        kind = prefer_gate.split(":")[1] if ":" in prefer_gate else prefer_gate
+        hinted = _UA_BY_KIND.get(kind)
+    gates: list[str] = []
+    for ua in (hinted, _MEDIA_GATE_MEMORY.get(host), *_MEDIA_GATES):
+        if ua and ua not in gates:
+            gates.append(ua)
+
+    for ua in gates:
+        try:
+            data = fetch(url, ua, max_bytes=max_bytes, referer=referer)
+        except Exception:
+            continue
+        if not data:
+            continue
+        mime = sniff_image_mime(data)
+        if mime:
+            _MEDIA_GATE_MEMORY[host] = ua       # recordar la puerta ganadora
+            return (data, mime)
+        # Llego algo que NO es una imagen (login-wall, redireccion, error
+        # HTML). No lo devolvemos: probamos la siguiente puerta.
+    return None
+
+
+def fetch_thumbnail_bytes(url: str, *, referer: str | None = None,
+                          prefer_gate: str | None = None) -> tuple[bytes, str] | None:
     """Alias historico de `fetch_image_bytes` (lo usa preview_thumbnail)."""
-    return fetch_image_bytes(url, referer=referer, max_bytes=_MAX_THUMB_BYTES)
+    return fetch_image_bytes(url, referer=referer, prefer_gate=prefer_gate,
+                             max_bytes=_MAX_THUMB_BYTES)

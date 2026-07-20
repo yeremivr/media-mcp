@@ -789,6 +789,14 @@ def parse_selection(which: str, n: int) -> list:
     return picked
 
 
+def _img_format(mime: str | None) -> str:
+    """Formato para incrustar la imagen. El mime ya viene VERIFICADO de los
+    magic bytes, asi que aqui solo se traduce: antes se decia "jpeg" para todo
+    lo que no fuera png y un webp llegaba mal etiquetado."""
+    sub = (mime or "image/jpeg").split("/")[-1].lower()
+    return sub if sub in ("png", "jpeg", "webp", "gif") else "jpeg"
+
+
 def _download_images_worker(job: dict):
     """Baja las fotos elegidas, una a una, y notifica UNA vez al final.
 
@@ -814,11 +822,16 @@ def _download_images_worker(job: dict):
         files, errors = [], []
         for i in picked:
             cand = imgs[i - 1]
-            got = _resolver.fetch_image_bytes(cand.url, referer=url)
+            # `prefer_gate`: la puerta que abrio la pagina abre tambien la
+            # foto (Facebook sirve las suyas por un endpoint de crawler).
+            got = _resolver.fetch_image_bytes(
+                cand.url, referer=url, prefer_gate=res.strategy)
             if not got:
                 errors.append(i)
                 continue
             data, ctype = got
+            # `ctype` viene de los magic bytes, no de la cabecera: si llego
+            # aqui es una imagen de verdad.
             ext = "png" if "png" in (ctype or "") else (
                 "webp" if "webp" in (ctype or "") else "jpg")
             # El numero va en el nombre para que la galeria las ordene igual
@@ -1298,6 +1311,7 @@ def preview_thumbnail(url: str):
         url: el enlace del video/reel/post.
     """
     thumb = None
+    strategy = None
     try:
         info = _extract_info(url)
         thumb = info.get("thumbnail")
@@ -1305,7 +1319,8 @@ def preview_thumbnail(url: str):
         pass
     if not thumb and _resolver is not None:
         try:
-            thumb = _resolver.resolve(url).thumbnail
+            res = _resolver.resolve(url)
+            thumb, strategy = res.thumbnail, res.strategy
         except Exception:
             pass
     if not thumb:
@@ -1313,16 +1328,16 @@ def preview_thumbnail(url: str):
     if _resolver is None:
         return {"ok": True, "thumbnail_url": thumb,
                 "note": "No puedo bajar la imagen en este server; te paso la URL."}
-    got = _resolver.fetch_thumbnail_bytes(thumb, referer=url)
+    got = _resolver.fetch_thumbnail_bytes(thumb, referer=url, prefer_gate=strategy)
     if not got:
         return {"ok": False, "thumbnail_url": thumb,
-                "error": "Tengo la URL de la miniatura pero no pude bajar los bytes."}
+                "error": "Tengo la URL de la miniatura pero lo que devuelve el "
+                         "CDN no es una imagen (login-wall o enlace expirado)."}
     data, ctype = got
     if Image is None:
         return {"ok": True, "thumbnail_url": thumb,
                 "note": "Esta version no puede incrustar imagenes; te paso la URL."}
-    fmt = "png" if "png" in (ctype or "").lower() else "jpeg"
-    return Image(data=data, format=fmt)
+    return Image(data=data, format=_img_format(ctype))
 
 
 @mcp.tool()
@@ -1352,15 +1367,17 @@ def preview_image(url: str, index: int = 1):
     if not (1 <= index <= len(imgs)):
         return {"ok": False,
                 "error": f"Ese post tiene {len(imgs)} foto(s); pediste la {index}."}
-    got = _resolver.fetch_image_bytes(imgs[index - 1].url, referer=url)
+    got = _resolver.fetch_image_bytes(imgs[index - 1].url, referer=url,
+                                      prefer_gate=res.strategy)
     if not got:
-        return {"ok": False, "error": "No pude bajar los bytes de esa foto."}
+        return {"ok": False,
+                "error": "Lo que devuelve el CDN para esa foto no es una "
+                         "imagen (login-wall o enlace expirado)."}
     data, ctype = got
     if Image is None:
         return {"ok": True, "image_url": imgs[index - 1].url,
                 "note": "Esta version no puede incrustar imagenes; te paso la URL."}
-    fmt = "png" if "png" in (ctype or "").lower() else "jpeg"
-    return Image(data=data, format=fmt)
+    return Image(data=data, format=_img_format(ctype))
 
 
 @mcp.tool()

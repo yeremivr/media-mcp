@@ -870,6 +870,17 @@ def main():
     ok &= check("dos fotos de elementos distintos no se confunden",
                 not R._same_item(_img(1), _img(3)))
 
+    # Y al reves: dos RENDITIONS del mismo video (video_versions/#0 y #1) SI
+    # son el mismo elemento. La ultima coordenada de un camino es el indice de
+    # rendition, no el del elemento, por eso se descarta antes de comparar.
+    # Sin esto, un video en 2 calidades se contaba como 2 videos distintos.
+    def _vid_r(i, r):
+        return tuple((f"{RAIZ}/if_not_gated_logged_out/carousel_media/#{i}"
+                      f"/video_versions/#{r}/url").split("/"))
+
+    ok &= check("dos renditions del mismo video son el mismo elemento",
+                R._same_item(_vid_r(0, 0), _vid_r(0, 1)))
+
     VIDS = [R.MediaCandidate(url=f"v{i}", score=110, kind="video", path=_vid(i))
             for i in (0, 2, 3, 4, 5)]
     FOTOS = [R.MediaCandidate(url=f"f{i}", score=140, kind="image",

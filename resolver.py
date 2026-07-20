@@ -1491,8 +1491,15 @@ def _same_item(p1: tuple, p2: tuple) -> bool:
     contenedor mas profundo decia "mismo elemento" cuando no lo era. La regla
     es mas estricta y mas simple: de TODOS los contenedores que comparten,
     ninguno puede discrepar. En cuanto uno lo hace, son elementos distintos.
+
+    Y un ultimo matiz, que salio al agrupar las renditions de un mismo video:
+    la ULTIMA coordenada de un camino es el indice de RENDITION, no el del
+    elemento. `video_versions/#0` y `video_versions/#1` son el mismo video en
+    dos calidades; `candidates/#0` es la primera rendition de una foto. Todo
+    lo que esta POR ENCIMA de esa ultima lista identifica QUE medio es; la
+    ultima solo dice EN QUE CALIDAD. Por eso se descarta antes de comparar.
     """
-    c1, c2 = _coords(p1), _coords(p2)
+    c1, c2 = _coords(p1)[:-1], _coords(p2)[:-1]
     if not c1 or not c2:
         return False
     por_clave: dict = {}

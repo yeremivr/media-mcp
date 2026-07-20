@@ -264,6 +264,42 @@ def main():
                 len(server2._RESOLVE_CACHE) <= server2._RESOLVE_CACHE_MAX)
     server2._resolver.resolve = real_resolve
 
+    print("\n=== CARRUSEL DE VIDEOS: uno por ELEMENTO, no uno en total ===")
+
+    # Un post de Instagram con 5 videos los servia TODOS con altura
+    # desconocida (h=0). `_curate_resolver` deduplicaba por altura, asi que se
+    # quedaba con UNO y tiraba cuatro EN SILENCIO. Caminos REALES capturados.
+    RZ = ("require/#0/#3/#0/__bbox/require/#7/#3/#1/__bbox/result/data/"
+          "xig_polaris_media")
+
+    def _vp(i, r=0):
+        return (f"{RZ}/if_not_gated_logged_out/carousel_media/#{i}"
+                f"/video_versions/#{r}/url")
+
+    fmts = [{"_cauce_muxed": True, "height": None, "_cauce_path": _vp(i)}
+            for i in (0, 2, 3, 4, 5)]
+    fmts.append({"_cauce_muxed": True, "height": None,
+                 "_cauce_path": _vp(0, 1)})        # otra rendition del #0
+    cur = server2._curate_resolver({"formats": fmts})
+    vids = [f for f in cur["formats"] if f["kind"] == "video"]
+    ok &= check("los 5 videos del carrusel sobreviven (antes quedaba 1)",
+                len(vids) == 5)
+    ok &= check("las 2 renditions del mismo video NO cuentan como dos",
+                len({v["format_id"] for v in vids}) == 5)
+    ok &= check("cada uno lleva su numero de elemento en el format_id",
+                any(v["format_id"].startswith("cauce-v1-") for v in vids))
+    ok &= check("y la etiqueta se lo dice al usuario",
+                any("de 5" in v["label"] for v in vids))
+
+    # Un solo video en varias calidades: los ids de SIEMPRE, sin numero.
+    uno = server2._curate_resolver({"formats": [
+        {"_cauce_muxed": True, "height": 1080, "_cauce_path": _vp(0)},
+        {"_cauce_muxed": True, "height": 360, "_cauce_path": _vp(0, 1)},
+    ]})
+    ok &= check("un solo video conserva los ids de siempre",
+                {f["format_id"] for f in uno["formats"]}
+                == {"cauce-v-1080", "cauce-v-360"})
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

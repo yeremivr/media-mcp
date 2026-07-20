@@ -673,6 +673,21 @@ def _do_download_resolved(job_id: str, url: str, format_id: str):
     fmts = [f for f in res.formats if f.kind == kind] or list(res.formats)
     if not fmts:
         raise RuntimeError("El resolver no devolvio formatos al descargar.")
+
+    # `cauce-v3-0` = el video del ELEMENTO 3 del carrusel. La re-resolucion
+    # reconstruye los mismos elementos (es la misma pagina, segundos despues),
+    # asi que el numero sigue apuntando al mismo video. Los ids de siempre
+    # (`cauce-v-1080`, sin numero) no entran por aqui.
+    partes = format_id.split("-")
+    quiere_elem = None
+    if len(partes) >= 3 and partes[1].startswith("v") and partes[1][1:].isdigit():
+        quiere_elem = int(partes[1][1:])
+    if quiere_elem is not None:
+        elems = _item_buckets([f.path for f in fmts])
+        del_elem = [f for f, e in zip(fmts, elems) if e == quiere_elem]
+        if del_elem:
+            fmts = del_elem
+
     if kind == "video" and want_h:
         chosen = min(fmts, key=lambda f: abs((f.height or 0) - want_h))
     else:
@@ -920,6 +935,34 @@ def _download_images_worker(job: dict):
                 icon="error_outline")
 
 
+def _item_buckets(paths: list) -> list:
+    """Agrupa candidatos por ELEMENTO del post: devuelve, para cada camino, el
+    numero de elemento al que pertenece.
+
+    Dos renditions del MISMO video comparten elemento; dos videos DISTINTOS de
+    un carrusel, no. Sin esto, `_curate_resolver` deduplicaba por altura y en
+    un carrusel de 5 videos —todos con altura desconocida, o sea h=0— se
+    quedaba con UNO y tiraba cuatro en silencio.
+
+    Los candidatos sin rastro de posicion (los que vienen del DOM) caen todos
+    en el elemento 0: es exactamente el comportamiento de antes, asi que las
+    plataformas de un solo video no notan el cambio."""
+    reps: list = []
+    out: list = []
+    for p in paths:
+        if not p:
+            out.append(0)
+            continue
+        k = next((i for i, r in enumerate(reps)
+                  if _resolver._same_item(p, r)), None)
+        if k is None:
+            reps.append(p)
+            k = len(reps) - 1
+        out.append(k + 1)          # 0 queda reservado para "sin rastro"
+    # Si NADIE trajo rastro, todo es un solo elemento.
+    return [0] * len(paths) if not reps else out
+
+
 def _curate_resolver(info: dict) -> dict:
     """Cura la salida del resolver estructural al MISMO esquema que list_formats
     (title/uploader/thumbnail/formats[{format_id,kind,label,filesize_mb}]) para
@@ -931,19 +974,34 @@ def _curate_resolver(info: dict) -> dict:
     vids: list = []
     auds: list = []
     seen_h = set()
-    for f in info.get("formats", []) or []:
+    fmts_in = list(info.get("formats", []) or [])
+    # A que ELEMENTO del post pertenece cada formato. Ver `_item_buckets`.
+    elems = _item_buckets([tuple((f.get("_cauce_path") or "").split("/"))
+                           if f.get("_cauce_path") else ()
+                           for f in fmts_in])
+    n_elems = len(set(e for e in elems if e))
+    for f, elem in zip(fmts_in, elems):
         muxed = f.get("_cauce_muxed", True)
         h = f.get("height") or 0
         tbr = f.get("tbr")
         size_mb = round(tbr * 1000 / 8 * duration / 1_000_000, 1) if (tbr and duration) else 0
         if muxed:
-            if h in seen_h:
+            # La deduplicacion por altura vale DENTRO de un elemento (mismo
+            # video en varias calidades). Entre elementos distintos son videos
+            # distintos que casualmente comparten altura desconocida.
+            if (elem, h) in seen_h:
                 continue
-            seen_h.add(h)
+            seen_h.add((elem, h))
+            # Con un solo elemento se conserva el id de siempre: nada cambia
+            # para los enlaces de un unico video, que son la mayoria.
+            fid = f"cauce-v-{h}" if n_elems <= 1 else f"cauce-v{elem}-{h}"
+            etiq = (f"{h}p (mp4)" if h else "Video (mp4)")
+            if n_elems > 1:
+                etiq = f"Video {elem} de {n_elems}" + (f" · {h}p" if h else "")
             vids.append((h, {
-                "format_id": f"cauce-v-{h}",
+                "format_id": fid,
                 "kind": "video",
-                "label": (f"{h}p (mp4)" if h else "Video (mp4)"),
+                "label": etiq,
                 "filesize_mb": size_mb,
             }))
         else:
@@ -1138,13 +1196,34 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
     curated = (_curate_resolver(info) if info.get("_cauce_resolver")
                else None)
 
-    # --- Caso FOTOS: el resolver ya dijo que hay carrusel/imagen ---
+    # --- Caso FOTOS (y MIXTO) ---
+    # Un post puede traer fotos Y videos a la vez. Antes `media_type` solo
+    # podia valer una cosa, se etiquetaba "video" y `grab` bajaba el video
+    # DESCARTANDO las fotos sin decir nada. Visto en vivo: un post de 3 fotos
+    # y 2 videos entregaba 1 archivo de 5. Aqui se baja TODO, que es lo que
+    # significa "bajame esto" cuando el usuario solo pega el enlace.
     if curated and curated.get("image_count"):
         res = download_images(url, which)
-        res["media_type"] = curated.get("media_type")
         res["title"] = res.get("title") or curated.get("title")
         res["full_caption"] = curated.get("full_caption")
         res["uploader"] = curated.get("uploader")
+        vids = [f for f in (curated.get("formats") or [])
+                if f.get("kind") == "video"]
+        if not vids:
+            res["media_type"] = curated.get("media_type")
+            return res
+        # Mixto: ademas de las fotos, un trabajo por cada video del post.
+        res["media_type"] = "mixed"
+        res["videos_encontrados"] = len(vids)
+        trabajos = []
+        for v in vids:
+            try:
+                trabajos.append(download(url, v["format_id"]).get("job_id"))
+            except Exception as e:
+                trabajos.append(f"error: {e}")
+        res["video_jobs"] = trabajos
+        res["message"] = (f"{res.get('message', '')} "
+                          f"Y {len(vids)} video(s) del mismo post en camino.")
         return res
 
     # --- Caso VIDEO ---

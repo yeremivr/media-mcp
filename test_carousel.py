@@ -457,6 +457,30 @@ def main():
     ok &= check("y sigue siendo la 'originals'",
                 "originals" in p.images[0].url)
 
+    print("\n=== Q. Envoltura de estadisticas del og:description (EN VIVO) ===")
+    # Capturado del post /p/DaaEZJ7Fsmx/ de Cosmopolitan: Instagram mete el
+    # caption dentro de "N likes, M comments - handle on <fecha>: ...".
+    q = R.resolve_html(
+        '<meta property="og:description" content=\'273K likes, 880 comments - '
+        'cosmopolitan on July 5, 2026: "@monicabarbaro and #AndrewGarfield '
+        'making a STRONG case for respectful PDA while at #Wimbledon '
+        'yesterday.".\'>'
+        '<script type="application/json">{"carousel_media":[{"image_versions2":'
+        '{"candidates":[{"url":"https://scontent.cdninstagram.com/v/t51.82787-15/'
+        '731787561_18607566088037517_1_n.jpg?stp=dst-jpg_e35_p1080x1080_tt6&oh=A"}]}}]}'
+        '</script>',
+        "https://www.instagram.com/p/DaaEZJ7Fsmx/")
+    print(f"    caption={q.full_caption!r}")
+    print(f"    uploader={q.uploader!r}  hashtags={q.hashtags}")
+    ok &= check("el caption NO arrastra las estadisticas",
+                q.full_caption and "likes" not in q.full_caption
+                and "comments" not in q.full_caption)
+    ok &= check("el caption SI conserva el texto real",
+                q.full_caption and "Wimbledon" in q.full_caption)
+    ok &= check("saca el handle como autor", q.uploader == "cosmopolitan")
+    ok &= check("los hashtags siguen saliendo",
+                q.hashtags == ["#AndrewGarfield", "#Wimbledon"])
+
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())
     ok &= check("selftest_carousel() (fotos) OK", R.selftest_carousel())

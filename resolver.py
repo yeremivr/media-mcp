@@ -1373,12 +1373,27 @@ _OG_TITLE_WRAPPER = re.compile(
     r'[\"“”](.*?)[\"“”]\s*$')
 
 
+# El og:description de Instagram envuelve el caption en estadisticas:
+#   '273K likes, 880 comments - cosmopolitan on July 5, 2026: "texto".'
+# Es ruido en CADA post: ensucia el caption, se arrastra al nombre del archivo
+# y le da a Claude datos irrelevantes. De paso, el `- <handle> on` trae el
+# usuario REAL (cosmopolitan), mas util que el nombre para mostrar.
+_OG_DESC_WRAPPER = re.compile(
+    r'(?is)^\s*[\d.,]+[KMB]?\s+likes?\s*,\s*[\d.,]+[KMB]?\s+comments?\s*'
+    r'[-–—]\s*(\S+?)\s+on\s+[^:]{3,60}?:\s*[\"“](.*?)[\"”]\s*\.?\s*$')
+
+
 def unwrap_og_title(t) -> tuple[str | None, str | None]:
-    """De 'Autor on Instagram: "texto"' saca (autor, texto). Si no cuadra el
-    patron, devuelve (None, el texto tal cual)."""
+    """De 'Autor on Instagram: "texto"' o de '<N> likes, <M> comments - autor
+    on <fecha>: "texto"' saca (autor, texto). Si no cuadra ningun patron,
+    devuelve (None, el texto tal cual)."""
     if not isinstance(t, str):
         return None, None
-    m = _OG_TITLE_WRAPPER.match(t.strip())
+    t = t.strip()
+    m = _OG_DESC_WRAPPER.match(t)
+    if m:
+        return m.group(1).strip() or None, m.group(2).strip() or None
+    m = _OG_TITLE_WRAPPER.match(t)
     if m:
         return m.group(1).strip() or None, m.group(2).strip() or None
     return None, t
@@ -1413,7 +1428,10 @@ def find_caption(metas: dict, json_trees: list) -> str | None:
     og:description suele venir cortado y el JSON trae el texto completo."""
     meta_cands: list[str] = []
     for k in ("og:description", "twitter:description", "description"):
-        c = _clean_caption(metas.get(k))
+        # og:description tambien puede venir envuelto en estadisticas
+        # ("273K likes, 880 comments - user on <fecha>: ..."): se desenvuelve.
+        _author, inner = unwrap_og_title(metas.get(k))
+        c = _clean_caption(inner)
         if c:
             meta_cands.append(c)
     # og:title suele traer el caption envuelto: 'Autor on Instagram: "..."'.
@@ -1529,6 +1547,12 @@ def _find_meta(dom_and_json, page_url) -> dict:
     og_author, og_text = unwrap_og_title(raw_title)
     if og_author and not meta["uploader"]:
         meta["uploader"] = og_author
+    if not meta["uploader"]:
+        # Fallback: el handle que va dentro del og:description envuelto
+        # ("... - cosmopolitan on July 5, 2026: ...").
+        desc_author, _ = unwrap_og_title(metas.get("og:description"))
+        if desc_author:
+            meta["uploader"] = desc_author
     if not meta["title"]:
         if og_text:
             first = next((ln.strip() for ln in og_text.splitlines() if ln.strip()), "")

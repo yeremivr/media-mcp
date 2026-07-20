@@ -680,6 +680,62 @@ def main():
                 R.fetch_image_bytes("https://ejemplo.com/x.jpg",
                                     fetch=lambda u, ua, **k: LOGIN_HTML) is None)
 
+    print("\n=== X. que lo aprendido SOBREVIVA al reinicio ===")
+    # Las memorias de puertas eran dicts en RAM: se vaciaban en cada
+    # `reload-cauce.sh`, asi que el sistema desaprendia cada vez que el usuario
+    # desplegaba. Se persisten guardando el NOMBRE de la puerta, no la cadena
+    # de User-Agent (esa puede cambiar de version; el nombre es estable).
+    import json as _json
+    import tempfile
+    import os as _os
+    tmpdir = tempfile.mkdtemp()
+    path = _os.path.join(tmpdir, "_gates.json")
+
+    R._HOST_MEMORY.clear()
+    R._MEDIA_GATE_MEMORY.clear()
+    R.load_gate_memory(path)                      # activa la persistencia
+    R._remember_gate(R._HOST_MEMORY, "www.facebook.com", (False, "googlebot"))
+    R._remember_gate(R._MEDIA_GATE_MEMORY, "lookaside.fbsbx.com",
+                     R._FACEBOOKBOT_UA)
+    ok &= check("escribe el fichero de puertas", _os.path.exists(path))
+    on_disk = _json.load(open(path, encoding="utf-8"))
+    ok &= check("guarda el NOMBRE de la puerta, no el User-Agent entero",
+                on_disk["media"]["lookaside.fbsbx.com"] == "facebookbot")
+
+    # Simular el reinicio: memorias vacias, volver a cargar.
+    R._HOST_MEMORY.clear()
+    R._MEDIA_GATE_MEMORY.clear()
+    ok &= check("carga el fichero al arrancar", R.load_gate_memory(path))
+    ok &= check("la puerta de PAGINA vuelve como TUPLA (se compara con tupla)",
+                R._HOST_MEMORY.get("www.facebook.com") == (False, "googlebot"))
+    ok &= check("la puerta de MEDIO vuelve como User-Agent real",
+                R._MEDIA_GATE_MEMORY.get("lookaside.fbsbx.com")
+                == R._FACEBOOKBOT_UA)
+
+    # Tras el "reinicio", la 1a foto ya no busca: va directa a la ganadora.
+    tried2: list = []
+
+    def fake2(url, ua, **k):
+        tried2.append(R.ua_kind(ua))
+        return JPEG if R.ua_kind(ua) == "facebookbot" else LOGIN_HTML
+
+    R.fetch_image_bytes("https://lookaside.fbsbx.com/lookaside/crawler/"
+                        "media/?media_id=1", fetch=fake2)
+    ok &= check("tras reiniciar, acierta al PRIMER intento (no re-aprende)",
+                tried2 == ["facebookbot"])
+
+    ok &= check("no escribe si el valor no cambio (no un fichero por foto)",
+                (lambda before: (R._remember_gate(R._MEDIA_GATE_MEMORY,
+                                                  "lookaside.fbsbx.com",
+                                                  R._FACEBOOKBOT_UA),
+                                 _os.path.getmtime(path) == before)[1])(
+                    _os.path.getmtime(path)))
+
+    ok &= check("un fichero corrupto NO tumba el arranque",
+                (open(path, "w").write("{no es json"),
+                 R.load_gate_memory(path) is False)[1])
+    R._MEMORY_PATH = None                          # no persistir en el resto
+
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())
     ok &= check("selftest_carousel() (fotos) OK", R.selftest_carousel())

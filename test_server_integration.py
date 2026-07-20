@@ -217,6 +217,53 @@ def main():
     di2, _ = server2._do_download_resolved("job2", "https://fb.com/reel/1", "cauce-v-1080")
     ok &= check("pidio 1080p -> bajo la HD_1080", "HD_1080" in server2.yt_dlp.YoutubeDL.last_url)
 
+    print("\n=== MEMORIA CORTA: no bajar dos veces la misma pagina ===")
+    # `grab` con fotos resolvia el enlace DOS veces con segundos de
+    # diferencia (una para decidir que es, otra dentro del worker de
+    # descarga), y `preview_image` una vez POR FOTO. Son descargas completas
+    # de la misma pagina: el coste esta en la RED, no en el scoring.
+    calls = {"n": 0}
+
+    class _FakeRes:
+        ok = True
+        strategy = "x:browser:original"
+
+    def fake_resolve(u):
+        calls["n"] += 1
+        return _FakeRes()
+
+    real_resolve = server2._resolver.resolve
+    server2._resolver.resolve = fake_resolve
+    server2._RESOLVE_CACHE.clear()
+
+    a = server2._resolve_cached("https://sitio.com/post/1")
+    b = server2._resolve_cached("https://sitio.com/post/1")
+    ok &= check("dos llamadas seguidas = UNA sola bajada de pagina",
+                calls["n"] == 1 and a is b)
+
+    server2._resolve_cached("https://sitio.com/post/2")
+    ok &= check("otra URL si vuelve a resolver (no confunde enlaces)",
+                calls["n"] == 2)
+
+    server2._resolve_cached("https://sitio.com/post/1", fresh=True)
+    ok &= check("fresh=True IGNORA el cache (lo usa la descarga de video, "
+                "que consume la URL firmada entera)", calls["n"] == 3)
+
+    # Caducidad: envejecemos la entrada a mano en vez de dormir el test.
+    ts, val = server2._RESOLVE_CACHE["https://sitio.com/post/2"]
+    server2._RESOLVE_CACHE["https://sitio.com/post/2"] = (
+        ts - server2._RESOLVE_TTL - 1, val)
+    server2._resolve_cached("https://sitio.com/post/2")
+    ok &= check("pasado el TTL vuelve a resolver (las URLs firmadas caducan)",
+                calls["n"] == 4)
+
+    for i in range(server2._RESOLVE_CACHE_MAX + 5):
+        server2._resolve_cached(f"https://sitio.com/otro/{i}")
+    ok &= check("el cache tiene tope (no crece sin limite en un server que "
+                "vive semanas)",
+                len(server2._RESOLVE_CACHE) <= server2._RESOLVE_CACHE_MAX)
+    server2._resolver.resolve = real_resolve
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

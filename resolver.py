@@ -90,6 +90,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import re
 import zlib
 from dataclasses import dataclass, field
@@ -291,6 +292,71 @@ MAX_ATTEMPTS = 8
 # dominio, y la probamos PRIMERO la proxima vez. En regimen normal esto hace
 # que casi siempre acertemos al primer fetch aunque el sitio cambie de forma.
 _HOST_MEMORY: dict = {}
+
+# --------------------------------------------------------------------------
+# QUE LO APRENDIDO SOBREVIVA AL REINICIO
+# --------------------------------------------------------------------------
+# Las dos memorias de arriba son dicts en RAM: se vaciaban en cada
+# `reload-cauce.sh`. O sea que el sistema DESAPRENDIA cada vez que el usuario
+# desplegaba codigo nuevo, y la primera peticion de cada host volvia a pagar
+# la busqueda de puerta a ciegas. Aprender y olvidar en el mismo dia no es
+# aprender.
+#
+# Se guarda el NOMBRE de la puerta ("googlebot"), no la cadena de User-Agent:
+# si un dia actualizamos el UA de Googlebot, un fichero viejo seguiria
+# forzando la cadena antigua. El nombre es estable; la cadena es un detalle.
+#
+# Si la puerta guardada resulta estar cerrada, se pierde UN intento y la
+# cascada re-aprende sola. Por eso esto puede persistirse sin miedo: el peor
+# caso es exactamente el comportamiento que teniamos siempre.
+_MEMORY_PATH: str | None = None
+
+
+def _remember_gate(memory: dict, key: str, value) -> None:
+    """Guarda una puerta ganadora y persiste SOLO si algo cambio (si no,
+    escribiriamos el fichero en cada foto de cada carrusel)."""
+    if memory.get(key) == value:
+        return
+    memory[key] = value
+    _save_gate_memory()
+
+
+def _save_gate_memory() -> None:
+    if not _MEMORY_PATH:
+        return
+    try:
+        data = {
+            "pages": {h: [bool(is_rw), kind] for h, (is_rw, kind) in _HOST_MEMORY.items()},
+            "media": {h: ua_kind(ua) for h, ua in _MEDIA_GATE_MEMORY.items()},
+        }
+        tmp = _MEMORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, _MEMORY_PATH)      # atomico: nunca un fichero a medias
+    except Exception:
+        pass                               # la memoria es una optimizacion,
+                                           # nunca un motivo para fallar
+
+
+def load_gate_memory(path: str) -> bool:
+    """Carga las puertas aprendidas y deja activada la persistencia."""
+    global _MEMORY_PATH
+    _MEMORY_PATH = path
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        for h, v in (data.get("pages") or {}).items():
+            if isinstance(v, list) and len(v) == 2:
+                _HOST_MEMORY[h] = (bool(v[0]), str(v[1]))   # TUPLA: se compara
+        for h, kind in (data.get("media") or {}).items():   # con una tupla
+            ua = _UA_BY_KIND.get(kind)
+            if ua:
+                _MEDIA_GATE_MEMORY[h] = ua
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 # ==========================================================================
@@ -2062,7 +2128,8 @@ def resolve(url: str, *, profile: Profile | None = None,
         if best is None or res.confidence > best.confidence or (res.ok and not best.ok):
             best = res
         if res.ok and res.confidence >= 0.6:
-            _HOST_MEMORY[host] = (a["is_rw"], a["ua_kind"])   # recordar el ganador
+            _remember_gate(_HOST_MEMORY, host,
+                           (a["is_rw"], a["ua_kind"]))       # recordar el ganador
             break   # suficientemente bueno: no gastamos mas red (RAPIDO)
     return best if best else ResolveResult(False, url, "none", 0.0,
                                            reason="Sin intentos posibles.")
@@ -2233,7 +2300,7 @@ def fetch_image_bytes(url: str, *, referer: str | None = None,
             continue
         mime = sniff_image_mime(data)
         if mime:
-            _MEDIA_GATE_MEMORY[host] = ua       # recordar la puerta ganadora
+            _remember_gate(_MEDIA_GATE_MEMORY, host, ua)   # puerta ganadora
             return (data, mime)
         # Llego algo que NO es una imagen (login-wall, redireccion, error
         # HTML). No lo devolvemos: probamos la siguiente puerta.

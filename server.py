@@ -111,6 +111,11 @@ def _default_download_dir() -> Path:
 DOWNLOAD_DIR = _default_download_dir()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_INDEX = DOWNLOAD_DIR / "_jobs.json"
+# Puertas aprendidas (que crawler abre cada sitio). Vive junto a las descargas
+# y NO en la galeria visible: empieza por "_" igual que el indice de jobs.
+GATES_MEMORY = DOWNLOAD_DIR / "_gates.json"
+if _resolver is not None and hasattr(_resolver, "load_gate_memory"):
+    _resolver.load_gate_memory(str(GATES_MEMORY))
 PWA_DIR = BASE_DIR / "pwa"
 
 PORT = int(os.environ.get("PORT", 8000))
@@ -496,6 +501,49 @@ def _extract_once(url: str, strategy: dict | None) -> dict:
     return info
 
 
+# --------------------------------------------------------------------------
+# MEMORIA CORTA DEL RESOLVER (no bajar dos veces la misma pagina)
+# --------------------------------------------------------------------------
+# `grab` con fotos resolvia el enlace DOS veces con segundos de diferencia:
+# una en _extract_info (para decidir si es video o fotos) y otra dentro del
+# worker de download_images. Son dos descargas COMPLETAS de la misma pagina,
+# y la pagina es la parte cara: el scoring del grafo son microsegundos, la
+# red son segundos. El cuello de botella nunca estuvo en el CPU.
+#
+# Por que un TTL corto y no un cache normal: las URLs de los CDN vienen
+# FIRMADAS y caducan. Ese es justo el motivo por el que el worker re-resuelve
+# — y hace bien. Pero caducan en HORAS, y aqui hablamos de reusar durante
+# segundos. 90 s esta dos ordenes de magnitud por debajo del riesgo: elimina
+# el viaje redundante sin tocar la garantia de frescura. Si el usuario mira
+# las fotos y decide bajarlas cinco minutos despues, el cache ya expiro y se
+# resuelve de nuevo, que es exactamente lo correcto.
+_RESOLVE_TTL = 90.0
+_RESOLVE_CACHE: dict = {}
+_RESOLVE_CACHE_MAX = 32
+_RESOLVE_LOCK = threading.Lock()
+
+
+def _resolve_cached(url: str, *, fresh: bool = False):
+    """`_resolver.resolve(url)` reusando el resultado si es de hace nada.
+
+    `fresh=True` fuerza la resolucion real (lo usa la descarga de video, que
+    necesita la URL firmada mas nueva posible porque la va a consumir entera).
+    """
+    now = time.time()
+    if not fresh:
+        with _RESOLVE_LOCK:
+            hit = _RESOLVE_CACHE.get(url)
+            if hit and (now - hit[0]) < _RESOLVE_TTL:
+                return hit[1]
+    res = _resolver.resolve(url)
+    with _RESOLVE_LOCK:
+        if len(_RESOLVE_CACHE) >= _RESOLVE_CACHE_MAX:
+            oldest = min(_RESOLVE_CACHE, key=lambda k: _RESOLVE_CACHE[k][0])
+            _RESOLVE_CACHE.pop(oldest, None)
+        _RESOLVE_CACHE[url] = (now, res)
+    return res
+
+
 def _extract_info(url: str) -> dict:
     """Extrae metadata + formatos, con RED DE SEGURIDAD estructural.
 
@@ -516,7 +564,7 @@ def _extract_info(url: str) -> dict:
 
     if not _is_youtube(url) and _resolver is not None:
         try:
-            res = _resolver.resolve(url)
+            res = _resolve_cached(url)
         except Exception:
             res = None
         if res is not None and getattr(res, "ok", False):
@@ -614,7 +662,7 @@ def _do_download_resolved(job_id: str, url: str, format_id: str):
     en list_formats. Elige la calidad pedida y baja la URL DIRECTA con yt-dlp
     (que igual hace el merge/HLS/DASH). El titulo/miniatura/autor los pone el
     resolver, porque yt-dlp sobre una URL pelada de CDN no los conoce."""
-    res = _resolver.resolve(url)
+    res = _resolve_cached(url, fresh=True)
     if not getattr(res, "ok", False):
         raise RuntimeError(res.reason or "El resolver no encontro el medio al descargar.")
 
@@ -806,7 +854,7 @@ def _download_images_worker(job: dict):
     job_id = job["job_id"]
     url = job["url"]
     try:
-        res = _resolver.resolve(url)
+        res = _resolve_cached(url)
         imgs = list(getattr(res, "images", []) or [])
         if not imgs:
             raise RuntimeError(res.reason or
@@ -1262,7 +1310,7 @@ def resolve_media(url: str) -> dict:
     if _resolver is None:
         return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
     try:
-        res = _resolver.resolve(url)
+        res = _resolve_cached(url)
     except Exception as e:
         return {"ok": False, "error": f"Fallo el resolver: {e}"}
     return {
@@ -1319,7 +1367,7 @@ def preview_thumbnail(url: str):
         pass
     if not thumb and _resolver is not None:
         try:
-            res = _resolver.resolve(url)
+            res = _resolve_cached(url)
             thumb, strategy = res.thumbnail, res.strategy
         except Exception:
             pass
@@ -1357,7 +1405,7 @@ def preview_image(url: str, index: int = 1):
     if _resolver is None:
         return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
     try:
-        res = _resolver.resolve(url)
+        res = _resolve_cached(url)
     except Exception as e:
         return {"ok": False, "error": f"Fallo el resolver: {e}"}
     imgs = list(getattr(res, "images", []) or [])

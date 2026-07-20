@@ -57,6 +57,28 @@ COMO FUNCIONA (arquitectura del algoritmo)
              mezclado con su margen sobre el 2do) para que el llamador sepa si
              confiar o caer al siguiente escalon de la cascada.
 
+6. IMAGEN -> El MISMO grafo se puntua una SEGUNDA vez con otro modelo lineal
+             (`score_image_candidate`, pesos `WI`) para sacar las FOTOS del
+             post: carruseles de Instagram (sidecar), pines de Pinterest,
+             albumes de Facebook, documentos de LinkedIn. Dos diferencias
+             finas frente al pase de video:
+               * IDENTIDAD por ID-de-medio, no por path: el CDN sirve la MISMA
+                 foto en varios tamanos bajo paths distintos (/s640x640/ vs
+                 /p1080x1080/). `image_identity()` extrae el id estable del
+                 medio para fusionar tamanos y quedarse con el mas grande.
+               * ORDEN DEL DOCUMENTO, no por puntaje: en un carrusel el ORDEN
+                 IMPORTA (foto 1, 2, 3...). El DFS arrastra un indice `order`
+                 y las fotos se devuelven en ese orden, no rankeadas.
+
+7. PUERTAS-> La resiliencia no es tener UN truco bueno, es tener MUCHAS
+             PUERTAS. Los sitios sociales dejan pasar sin login a los robots
+             que arman la tarjeta de vista previa de un link (Googlebot,
+             Bingbot, facebookexternalhit, Twitterbot, Slackbot, WhatsApp,
+             Discordbot). Son puertas de DUENOS DISTINTOS: no se cierran todas
+             el mismo dia. `resolve()` las prueba en cascada round-robin, corta
+             apenas una da confianza suficiente, y RECUERDA por-host cual gano
+             para liderar con esa la proxima vez.
+
 Todo es STDLIB PURA (html.parser, json, re, urllib): en Termux/Android compilar
 dependencias con C (lxml, etc.) es un via crucis, asi que NO usamos ninguna.
 
@@ -88,6 +110,7 @@ MEDIA_CDN_HOSTS = re.compile(
     r"""(?xi)
     (
       dms\.licdn\.com                 # LinkedIn video/media
+    | media\.licdn\.com               # LinkedIn imagenes (feedshare, documentos)
     | [\w.-]*\.fbcdn\.net             # Facebook / Instagram video
     | [\w.-]*\.cdninstagram\.com      # Instagram
     | scontent[\w.-]*\.(?:fbcdn\.net|cdninstagram\.com)
@@ -171,15 +194,63 @@ MIN_ACCEPT_SCORE = 40.0
 _HTTP_TIMEOUT = 15
 _MAX_HTML_BYTES = 8 * 1024 * 1024      # 8 MB de HTML es mas que suficiente
 _MAX_THUMB_BYTES = 6 * 1024 * 1024
+_MAX_IMAGE_BYTES = 24 * 1024 * 1024    # una foto de carrusel en full res
 
 _BROWSER_UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, "
                "like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-# Googlebot recibe el HTML pre-renderizado (SSR) en sitios como LinkedIn.
+
+# --------------------------------------------------------------------------
+# LA CASCADA DE PUERTAS (multi-crawler)
+# --------------------------------------------------------------------------
+# Los sitios sociales tienen login-wall para personas, pero DEJAN PASAR a los
+# robots que necesitan para existir comercialmente:
+#   * los BUSCADORES (Googlebot, Bingbot) -> si no, no aparecen en Google.
+#   * los DESPLEGADORES DE LINK (facebookexternalhit, Twitterbot, Slackbot,
+#     WhatsApp, Discordbot, TelegramBot) -> si no, al pegar el link en un chat
+#     no sale la tarjetita con foto y titulo, y nadie hace clic.
+# Cada uno es una PUERTA DISTINTA, con dueno distinto y politica distinta.
+# Depender de una sola (Googlebot) es un punto unico de fallo: el dia que el
+# sitio verifique el rDNS del que dice ser Googlebot, se acabo. Depender de
+# SIETE es resiliencia real: tienen que cerrarlas todas para tumbarte.
 _GOOGLEBOT_UA = ("Mozilla/5.0 (compatible; Googlebot/2.1; "
                  "+http://www.google.com/bot.html)")
+_BINGBOT_UA = ("Mozilla/5.0 (compatible; bingbot/2.0; "
+               "+http://www.bing.com/bingbot.htm)")
+_FACEBOOKBOT_UA = ("facebookexternalhit/1.1 "
+                   "(+http://www.facebook.com/externalhit_uatext.php)")
+_TWITTERBOT_UA = "Twitterbot/1.0"
+_SLACKBOT_UA = ("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)")
+_WHATSAPP_UA = "WhatsApp/2.24.6.77 A"
+_DISCORDBOT_UA = ("Mozilla/5.0 (compatible; Discordbot/2.0; "
+                  "+https://discordapp.com)")
+_TELEGRAMBOT_UA = "TelegramBot (like TwitterBot)"
+
+# Nombre corto de cada puerta (para diagnostico y para la memoria por-host).
+_UA_KIND = {
+    _BROWSER_UA: "browser",
+    _GOOGLEBOT_UA: "googlebot",
+    _BINGBOT_UA: "bingbot",
+    _FACEBOOKBOT_UA: "facebookbot",
+    _TWITTERBOT_UA: "twitterbot",
+    _SLACKBOT_UA: "slackbot",
+    _WHATSAPP_UA: "whatsapp",
+    _DISCORDBOT_UA: "discordbot",
+    _TELEGRAMBOT_UA: "telegrambot",
+}
+
+
+def ua_kind(ua: str) -> str:
+    """Nombre corto de la puerta (para diagnostico legible)."""
+    return _UA_KIND.get(ua, "browser")
+
 
 # Alias PUBLICO para que el server reutilice el mismo UA al bajar el archivo.
 BROWSER_UA = _BROWSER_UA
+
+# Cuantos intentos (target x puerta) como MAXIMO antes de rendirse. Sin tope,
+# 3 reescrituras x 7 puertas = 21 fetches x 15 s = 5 minutos de espera: peor
+# que fallar rapido. Con la memoria por-host, en regimen normal se gasta 1.
+MAX_ATTEMPTS = 8
 
 # MEMORIA POR-HOST (auto-sanacion): recordamos que CLASE de intento
 # (original vs reescritura, y que User-Agent) resolvio por ultima vez cada
@@ -217,31 +288,75 @@ def _linkedin_rewrites(url: str) -> list[str]:
     return outs
 
 
+def _instagram_rewrites(url: str) -> list[str]:
+    """Instagram publica un ENDPOINT DE INCRUSTACION publico y sin login:
+    `/p/<code>/embed/captioned/`. Devuelve HTML server-rendered con la
+    descripcion COMPLETA y, en los carruseles, las fotos del sidecar. Es la
+    misma puerta que usan Medium/Notion cuando incrustas un post."""
+    m = re.search(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]{5,})", url)
+    if not m:
+        return []
+    code = m.group(1)
+    return [f"https://www.instagram.com/p/{code}/embed/captioned/",
+            f"https://www.instagram.com/p/{code}/embed/"]
+
+
+def _facebook_rewrites(url: str) -> list[str]:
+    """`m.facebook.com` sirve una version mas simple y menos ofuscada del
+    mismo post. No siempre existe, pero cuando existe es oro."""
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if host in ("www.facebook.com", "facebook.com", "web.facebook.com"):
+        return [p._replace(netloc="m.facebook.com").geturl()]
+    return []
+
+
 PROFILES = (
     Profile(
         name="linkedin",
         host_re=re.compile(r"(?i)(?:^|\.)linkedin\.com$"),
-        user_agents=(_GOOGLEBOT_UA, _BROWSER_UA),
+        # LinkedIn le abre a los buscadores (quiere posicionar) y a los
+        # desplegadores de link (quiere que su tarjeta salga en los chats).
+        user_agents=(_GOOGLEBOT_UA, _BINGBOT_UA, _SLACKBOT_UA,
+                     _TWITTERBOT_UA, _FACEBOOKBOT_UA, _BROWSER_UA),
         rewrites=(_linkedin_rewrites,),
     ),
     Profile(
         name="facebook",
         host_re=re.compile(r"(?i)(?:^|\.)(facebook\.com|fb\.watch|fb\.com)$"),
-        user_agents=(_BROWSER_UA, _GOOGLEBOT_UA),
+        user_agents=(_BROWSER_UA, _GOOGLEBOT_UA, _TWITTERBOT_UA,
+                     _SLACKBOT_UA, _WHATSAPP_UA, _BINGBOT_UA),
+        rewrites=(_facebook_rewrites,),
     ),
     Profile(
         name="instagram",
         host_re=re.compile(r"(?i)(?:^|\.)instagram\.com$"),
-        user_agents=(_BROWSER_UA, _GOOGLEBOT_UA),
+        user_agents=(_BROWSER_UA, _GOOGLEBOT_UA, _FACEBOOKBOT_UA,
+                     _TWITTERBOT_UA, _WHATSAPP_UA, _BINGBOT_UA),
+        rewrites=(_instagram_rewrites,),
+    ),
+    Profile(
+        name="pinterest",
+        host_re=re.compile(r"(?i)(?:^|\.)(pinterest\.[\w.]+|pin\.it)$"),
+        # Pinterest vive del SEO: a los buscadores les da el pin completo.
+        user_agents=(_GOOGLEBOT_UA, _BROWSER_UA, _BINGBOT_UA,
+                     _TWITTERBOT_UA, _SLACKBOT_UA),
     ),
     Profile(
         name="twitter",
         host_re=re.compile(r"(?i)(?:^|\.)(twitter\.com|x\.com)$"),
-        user_agents=(_BROWSER_UA,),
+        user_agents=(_BROWSER_UA, _GOOGLEBOT_UA, _TELEGRAMBOT_UA,
+                     _SLACKBOT_UA),
     ),
 )
 
-_GENERIC_PROFILE = Profile(name="generic", host_re=re.compile(r".^"))
+# Perfil por defecto: tambien con cascada de puertas. Un blog o un CMS
+# cualquiera puede estar detras de un muro suave que si le abre a un bot.
+_GENERIC_PROFILE = Profile(
+    name="generic",
+    host_re=re.compile(r".^"),
+    user_agents=(_BROWSER_UA, _GOOGLEBOT_UA, _TWITTERBOT_UA, _SLACKBOT_UA),
+)
 
 
 def profile_for(url: str) -> Profile:
@@ -260,9 +375,14 @@ def profile_for(url: str) -> Profile:
 class DomMedia:
     """Un candidato que vino DIRECTO del DOM (no de JSON): <video>/<source>/
     <meta og:video>. Se le da un plus porque el navegador lo trataria como
-    reproducible sin ambiguedad."""
+    reproducible sin ambiguedad.
+
+    `is_img=True` marca los que vinieron de <img>/srcset/og:image: son
+    candidatos legitimos para el pase de IMAGEN, pero NO deben cobrar el bono
+    `dom_video_tag` del pase de video (un <img> no es un reproducible)."""
     url: str
     attrs: dict = field(default_factory=dict)
+    is_img: bool = False
 
 
 class _MediaHTMLParser(HTMLParser):
@@ -278,8 +398,15 @@ class _MediaHTMLParser(HTMLParser):
         self.dom_media: list[DomMedia] = []
         self.json_texts: list[str] = []
         self.attr_json: list[str] = []
+        # metas: TODOS los <meta property|name -> content>. De aqui salen
+        # og:title / og:description / og:image, que es lo que los sitios
+        # sociales SI le sirven a un bot de vista previa (nuestra puerta).
+        self.metas: dict = {}
+        self.page_title: str | None = None
         self._capture_stack: list[str] = []   # 'script' | 'code'
         self._buf: list[str] = []
+        self._in_title = False
+        self._title_buf: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
@@ -294,17 +421,48 @@ class _MediaHTMLParser(HTMLParser):
             for k in ("data-hd-src", "data-sd-src", "data-video-url"):
                 if a.get(k):
                     self.dom_media.append(DomMedia(a[k], a))
+        elif tag == "img":
+            # Las FOTOS de un carrusel server-rendered (lo que ve Googlebot)
+            # llegan como <img src>/<img srcset>. Antes las tirabamos.
+            for k in ("src", "data-src", "data-delayed-url", "data-lazy-src"):
+                if a.get(k):
+                    self.dom_media.append(DomMedia(a[k], a, is_img=True))
+            for u in _parse_srcset(a.get("srcset") or a.get("data-srcset") or ""):
+                self.dom_media.append(DomMedia(u, a, is_img=True))
+        elif tag == "link":
+            rel = (a.get("rel") or "").lower()
+            if "image_src" in rel and a.get("href"):
+                self.dom_media.append(DomMedia(a["href"], {"from": "link:image_src"},
+                                               is_img=True))
         elif tag == "meta":
             prop = (a.get("property") or a.get("name") or "").lower()
+            content = a.get("content") or ""
+            if prop and content:
+                # nos quedamos con la PRIMERA ocurrencia (la canonica);
+                # og:image se repite N veces en los carruseles -> las guardamos
+                # todas en una lista aparte, en ORDEN (eso ES el carrusel).
+                self.metas.setdefault(prop, content)
+                if prop in ("og:image", "og:image:url", "og:image:secure_url",
+                            "twitter:image", "twitter:image:src"):
+                    self.dom_media.append(DomMedia(content, {"from": prop},
+                                                   is_img=True))
             if prop in ("og:video", "og:video:url", "og:video:secure_url",
                         "twitter:player:stream", "og:audio"):
-                if a.get("content"):
-                    self.dom_media.append(DomMedia(a["content"], {"from": prop}))
+                if content:
+                    self.dom_media.append(DomMedia(content, {"from": prop}))
+        elif tag == "title":
+            self._in_title = True
+            self._title_buf = []
         if tag in ("script", "code"):
             self._capture_stack.append(tag)
             self._buf = []
 
     def handle_endtag(self, tag):
+        if tag == "title" and self._in_title:
+            self._in_title = False
+            t = "".join(self._title_buf).strip()
+            if t and self.page_title is None:
+                self.page_title = t
         if self._capture_stack and tag == self._capture_stack[-1]:
             self._capture_stack.pop()
             text = "".join(self._buf).strip()
@@ -315,6 +473,21 @@ class _MediaHTMLParser(HTMLParser):
     def handle_data(self, data):
         if self._capture_stack:
             self._buf.append(data)
+        elif self._in_title:
+            self._title_buf.append(data)
+
+
+def _parse_srcset(srcset: str) -> list[str]:
+    """`srcset` es "url1 320w, url2 640w, url3 2x": nos quedamos con TODAS las
+    URLs (el pase de imagen ya fusiona tamanos del mismo medio y elige el mas
+    grande). Parseo tolerante: las URLs pueden llevar comas dentro del query,
+    asi que cortamos por coma-seguida-de-espacio-y-algo-que-parece-URL."""
+    out = []
+    for part in re.split(r",(?=\s*(?:https?:)?//|\s*/)", srcset or ""):
+        tok = part.strip().split()
+        if tok and len(tok[0]) > 8:
+            out.append(tok[0])
+    return out
 
 
 def _iter_json_objects(text: str) -> Iterator[object]:
@@ -390,8 +563,12 @@ def _match_balanced(s: str, start: int) -> int | None:
     return None
 
 
-def iter_islands(html: str) -> tuple[list[DomMedia], list[object]]:
-    """Cosecha del HTML: (media directa del DOM, lista de arboles JSON)."""
+def iter_islands(html: str) -> tuple[list[DomMedia], list[object], dict]:
+    """Cosecha del HTML: (media directa del DOM, arboles JSON, meta tags).
+
+    El 3er elemento (`metas`) es lo que hace posible la Implementacion 1 de la
+    que hablamos: og:description / twitter:description traen el CAPTION COMPLETO
+    del post, que es justo lo que yt-dlp no expone en Instagram."""
     parser = _MediaHTMLParser()
     try:
         parser.feed(html)
@@ -408,7 +585,10 @@ def iter_islands(html: str) -> tuple[list[DomMedia], list[object]]:
     for text in parser.json_texts:
         for obj in _iter_json_objects(text):
             json_trees.append(obj)
-    return parser.dom_media, json_trees
+    metas = dict(parser.metas)
+    if parser.page_title:
+        metas.setdefault("<title>", parser.page_title)
+    return parser.dom_media, json_trees, metas
 
 
 # ==========================================================================
@@ -425,6 +605,11 @@ class RawCandidate:
     depth: int
     from_dom: bool = False
     dom_attrs: dict = field(default_factory=dict)
+    is_img: bool = False         # vino de <img>/srcset/og:image
+    # ORDEN DE APARICION en el documento. Para un carrusel el orden IMPORTA
+    # (foto 1, 2, 3...) y no coincide con el ranking por puntaje. El DFS
+    # visita en orden de documento, asi que este indice ES el orden real.
+    order: int = 0
 
 
 _URLISH = re.compile(r"(?i)^(https?:)?//|^/dms/|^/playlist/")
@@ -491,6 +676,7 @@ class MediaCandidate:
     ext: str | None = None
     mime: str | None = None
     provenance: str = ""           # de donde salio (para depurar / transparencia)
+    order: int = 0                 # posicion en el documento (orden del carrusel)
 
     @property
     def identity(self) -> str:
@@ -614,6 +800,14 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
     h, w, tbr, mime = _extract_dims(rc)
 
     # Decidir tipo. Preferimos VIDEO salvo evidencia clara de audio puro.
+    # Un <img>/srcset/og:image NUNCA es un reproducible, por mas que su clave
+    # se llame `src` (que esta en el lexico de medios) y viva en un CDN. Sin
+    # esta salida temprana, el logo de una empresa en un <img> puntuaba 74 y
+    # se colaba como "formato de video".
+    if rc.is_img and not is_video and not is_audio:
+        return MediaCandidate(full, s, "image", h, w, None, _ext_of(url), mime,
+                              provenance=f"{'/'.join(rc.ancestors[-3:])}::{rc.key} "
+                                         f"[{','.join(feats)}]")
     if is_video or (mime and mime.startswith("video")):
         kind = "video"
     elif is_audio or (mime and mime.startswith("audio")):
@@ -622,14 +816,286 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
         return MediaCandidate(full, s, "image", h, w, tbr, _ext_of(url), mime,
                               provenance=f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{','.join(feats)}]")
     else:
-        # sin extension clara: si vive en CDN de medios y tiene dims, es video.
-        if MEDIA_CDN_HOSTS.search(host) and (rc.siblings & DIMENSION_SIBLINGS):
-            kind = "video"
-        else:
-            kind = "video"  # por defecto lo tratamos como video candidato
+        # SIN extension ni mimetype claros. Antes esto caia a "video" siempre,
+        # y con URLs sin extension (las de /dms/image/ de LinkedIn) metia FOTOS
+        # en la lista de formatos reproducibles. Ahora exigimos EVIDENCIA
+        # POSITIVA de video; si no la hay, lo tratamos como imagen (el pase de
+        # imagen decidira si vale la pena) en vez de ensuciar los formatos.
+        has_video_evidence = (
+            "anc_v" in feats or "key" in feats or "dom" in feats or "vmime" in feats
+            or ("cdn" in feats and "dims" in feats and "anc_img" not in feats)
+        )
+        kind = "video" if has_video_evidence else "image"
 
     prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
     return MediaCandidate(full, round(s, 1), kind, h, w, tbr, _ext_of(url), mime, prov)
+
+
+# ==========================================================================
+# 4-bis. SCORING DE IMAGENES  (carruseles, albumes, pines)
+# ==========================================================================
+# El pase de VIDEO castiga las imagenes (-55) a proposito: no queremos el
+# poster ni el avatar mezclados con los formatos reproducibles. Pero esas
+# imagenes YA las teniamos en la mano y las estabamos tirando a la basura.
+# Este segundo modelo lineal las rescata y separa las FOTOS DEL POST (lo que
+# el usuario quiere bajar) del RUIDO (avatares, logos, iconos, sprites).
+#
+# La dificultad real no es "encontrar imagenes" —sobran—, es DISTINGUIR la
+# foto del contenido del adorno de la interfaz. Las senales que de verdad
+# discriminan resultaron ser tres, y ninguna depende del nombre de la clave:
+#   (a) TAMANO: una foto de post mide >=600px de lado; un avatar, 50-150px.
+#   (b) UBICACION EN EL CDN: las plataformas separan por prefijo de path el
+#       contenido (fbcdn /t51.2885-15/) del perfil (/t51.2885-19/) y de los
+#       assets estaticos de la interfaz (static.licdn.com, /rsrc.php/).
+#   (c) VECINDARIO: estar colgando de `edge_sidecar_to_children`, `carousel`,
+#       `slides` o `images` es practicamente una confesion.
+
+WI = {
+    "host_media_cdn": 38.0,
+    "ext_image": 22.0,
+    "signed_params": 10.0,
+    "key_image": 18.0,
+    "sibling_dims": 12.0,
+    "ancestor_carousel": 26.0,   # sidecar/carousel/slides/children/gallery
+    "ancestor_image": 10.0,      # image/photo/media (suave: es esperable)
+    "big_dims": 20.0,            # >=600px de lado por hermanas o por el path
+    "dom_img": 8.0,
+    "og_image": 14.0,            # vino de og:image / twitter:image
+    # castigos
+    "avatar_like": -80.0,        # avatar/profile/logo/icon/sprite/emoji/badge
+    "static_asset": -70.0,       # assets de la interfaz, no contenido
+    "tiny_dims": -60.0,          # <200px de lado -> es un adorno
+    "vector_or_ico": -80.0,      # .svg/.ico jamas son la foto del post
+    "data_uri": -1000.0,
+    "tracking": -60.0,
+    "not_http": -1000.0,
+}
+
+MIN_IMAGE_SCORE = 46.0
+MAX_IMAGES = 24          # tope defensivo: ningun carrusel real pasa de ~20
+
+# Claves que suelen apuntar a la foto de contenido.
+IMAGE_KEY_LEXICON = (
+    "display_url", "display_src", "display_resources", "image_url", "imageurl",
+    "thumbnail_src", "contenturl", "src", "uri", "url", "image", "photo",
+    "original", "large", "orig", "hd", "media_url",
+)
+
+# Ancestros que gritan "esto es un carrusel / album / galeria".
+ANCESTOR_CAROUSEL_HINT = (
+    "sidecar", "carousel", "slide", "children", "edges", "gallery", "album",
+    "images", "photos", "attachments", "subattachments", "resources", "items",
+)
+
+# Rutas de CDN que son ASSET DE INTERFAZ, no contenido del post.
+STATIC_ASSET_HINT = re.compile(
+    r"(?i)(static[\w.-]*\.(?:licdn|fbcdn|xx\.fbcdn)\.com|/rsrc\.php/|/static/|"
+    r"/assets?/|/dist/|/bundles?/|sprite|/emoji/|favicon)",
+)
+
+# Tokens que delatan un avatar / logo / icono en el path o en las claves.
+AVATAR_HINT = re.compile(
+    r"(?i)(avatar|profile[-_]?pic|profile_image|/pfp|headshot|company[-_]?logo|"
+    r"\blogo\b|/icon|placeholder|ghost|default[-_]?user|badge|watermark)",
+)
+
+# Instagram/Facebook codifican el TIPO de foto en el prefijo del path:
+#   t51.2885-15 -> foto de FEED (contenido)   |  t51.2885-19 -> FOTO DE PERFIL
+_IG_PROFILE_PATH = re.compile(r"/t51\.2885-19/|/t51\.\d+-19/")
+
+# Tamano codificado en el path: /s640x640/, /p1080x1080/, /564x/, _1280.jpg
+_PATH_SIZE = re.compile(r"(?i)[/_](?:[sp])?(\d{2,4})x(\d{2,4})[/_]|[/_](\d{3,4})x?/")
+
+# Marcadores de "esta es LA version original, sin recortar". Pinterest usa
+# /originals/, otros /full/ o /source/. No traen numero, pero son por
+# definicion la mas grande: si no las tratamos como maximas, el agrupador
+# elegiria la /736x/ (que si trae numero) y bajariamos la foto en chico.
+_FULLSIZE_HINT = re.compile(r"(?i)/(originals?|orig|full|source|raw|master)/")
+_FULLSIZE_PX = 100000     # sentinela: "mas grande que cualquier rendition"
+
+
+def _path_size(url: str) -> tuple[int | None, int | None]:
+    """Tamano (ancho, alto) que el CDN codifica en la propia ruta. Es la senal
+    mas barata y sorprendentemente fiable para separar foto de adorno."""
+    path = urlparse(url).path
+    if _FULLSIZE_HINT.search(path):
+        return _FULLSIZE_PX, _FULLSIZE_PX
+    m = _PATH_SIZE.search(path)
+    if not m:
+        return None, None
+    if m.group(1) and m.group(2):
+        return _int_or_none(m.group(1)), _int_or_none(m.group(2))
+    if m.group(3):
+        v = _int_or_none(m.group(3))
+        return v, v
+    return None, None
+
+
+def _image_dims(rc: RawCandidate, url: str) -> tuple[int | None, int | None]:
+    """(ancho, alto) de una FOTO. Deliberadamente NO reusa `_extract_dims`:
+    aquella tiene una heuristica pensada para VIDEO que lee "720" de un path
+    tipo `/720p/` y en un nombre de foto (`444_555_666_n.jpg`) se confunde y
+    devuelve alto=444. Aqui solo confiamos en claves explicitas y en el
+    tamano codificado por el CDN."""
+    obj = rc.sibling_obj or {}
+    lower = {str(k).lower(): v for k, v in obj.items()} if isinstance(obj, dict) else {}
+    w = _int_or_none(lower.get("width") or lower.get("config_width")
+                     or lower.get("image_width") or lower.get("orig_width"))
+    h = _int_or_none(lower.get("height") or lower.get("config_height")
+                     or lower.get("image_height") or lower.get("orig_height"))
+    pw, ph = _path_size(url)
+    return (w or pw), (h or ph)
+
+
+def image_identity(url: str) -> str:
+    """IDENTIDAD DE UNA FOTO (no de una URL).
+
+    El mismo archivo se sirve en varios tamanos bajo paths distintos:
+        .../s640x640/123_456_789_n.jpg      <- version chica
+        .../p1080x1080/123_456_789_n.jpg    <- version grande
+    Deduplicar por `host+path` (como hace el pase de video) los trataria como
+    DOS fotos y devolveria el carrusel duplicado. Aqui extraemos el ID ESTABLE
+    del medio, que es lo unico que se conserva entre renditions:
+
+      * LinkedIn  /dms/image/v2/<ASSET_ID>/<rendition>/...  -> ASSET_ID
+      * FB/IG     .../<id1>_<id2>_<id3>_n.jpg               -> el trio de ids
+      * Pinterest /<size>/aa/bb/cc/<hash>.jpg               -> el hash
+      * generico  el basename sin los sufijos de tamano
+
+    Ojo con LinkedIn: NO sirve el basename, porque su ultimo segmento es un
+    timestamp que varias fotos distintas comparten. Por eso va primero y por
+    ASSET_ID, que si es unico por foto."""
+    p = urlparse(url)
+    path = p.path
+
+    m = re.search(r"/dms/(?:image|document)/(?:v2/)?([A-Za-z0-9_-]{8,})", path)
+    if m:
+        return f"li:{m.group(1)}"
+
+    base = path.rsplit("/", 1)[-1]
+
+    host = (p.hostname or "").lower()
+    if re.search(r"(?:fbcdn\.net|cdninstagram\.com)$", host):
+        # En los CDN de Meta el basename ES el id del medio. Solo aplicamos
+        # este patron EN ESOS HOSTS: en un sitio cualquiera, un nombre tipo
+        # `2024_01_15_playa.jpg` lo cumpliria y fusionaria fotos distintas.
+        m = re.match(r"(\d{3,}_\d{3,}_\d{3,})", base)
+        if m:
+            return f"fb:{m.group(1)}"
+    m = re.match(r"(\d{6,}_\d{6,}_\d{6,})", base)
+    if m:
+        return f"fb:{m.group(1)}"
+
+    m = re.search(r"/([0-9a-f]{16,})\.(?:jpe?g|png|webp|gif)", path, re.I)
+    if m:
+        return f"h:{m.group(1).lower()}"
+
+    # Generico: quita sufijos de tamano del basename (foto-640x480.jpg,
+    # foto_1280w.jpg, foto-thumb.jpg) para que las variantes converjan.
+    stem = re.sub(r"(?i)[-_](?:\d{2,4}x\d{2,4}|\d{3,4}w|thumb(?:nail)?|small|"
+                  r"medium|large|orig(?:inal)?)(?=\.|$)", "", base)
+    return f"b:{(p.hostname or '').lower()}:{stem.lower()}" if stem else f"u:{url}"
+
+
+def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
+    """Modelo lineal del pase de IMAGEN. Devuelve un MediaCandidate kind=image
+    con su puntaje, o None si la URL no es http(s) utilizable."""
+    url = rc.url
+    if url.startswith("data:"):
+        return None
+    parsed = urlparse(url if "://" in url else urljoin(page_url, url))
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    full = parsed.geturl()
+
+    key_l = rc.key.lower()
+    anc_l = " ".join(rc.ancestors).lower()
+    host = parsed.hostname.lower()
+    path = parsed.path
+
+    s = 0.0
+    feats = []
+
+    if MEDIA_CDN_HOSTS.search(host):
+        s += WI["host_media_cdn"]; feats.append("cdn")
+
+    ext = _ext_of(url)
+    if IMAGE_EXT.search(url) or ext in ("jpg", "jpeg", "png", "webp", "heic"):
+        s += WI["ext_image"]; feats.append("iext")
+    if ext in ("svg", "ico", "gif"):
+        s += WI["vector_or_ico"]; feats.append("vector")
+    # Un .mp4/.m3u8 NO es una foto: fuera del pase de imagen.
+    if VIDEO_EXT.search(url) or AUDIO_EXT.search(url):
+        return None
+
+    if SIGNED_PARAM.search(url):
+        s += WI["signed_params"]; feats.append("signed")
+
+    if any(tok in key_l for tok in IMAGE_KEY_LEXICON):
+        s += WI["key_image"]; feats.append("key")
+
+    if rc.siblings & DIMENSION_SIBLINGS:
+        s += WI["sibling_dims"]; feats.append("dims")
+
+    if any(tok in anc_l for tok in ANCESTOR_CAROUSEL_HINT):
+        s += WI["ancestor_carousel"]; feats.append("carousel")
+    elif any(tok in anc_l for tok in ANCESTOR_IMAGE_HINT):
+        s += WI["ancestor_image"]; feats.append("anc_img")
+
+    if rc.is_img:
+        frm = (rc.dom_attrs or {}).get("from", "")
+        if "og:image" in frm or "twitter:image" in frm or "image_src" in frm:
+            s += WI["og_image"]; feats.append("og")
+        else:
+            s += WI["dom_img"]; feats.append("dom")
+
+    # --- Tamano: la senal mas discriminante ---
+    eff_w, eff_h = _image_dims(rc, url)
+    big = max(eff_w or 0, eff_h or 0)
+    if big >= 600:
+        s += WI["big_dims"]; feats.append("big")
+    elif big and big < 200:
+        s += WI["tiny_dims"]; feats.append("tiny")
+
+    # --- Castigos de "esto es interfaz, no contenido" ---
+    if AVATAR_HINT.search(path) or AVATAR_HINT.search(key_l) or AVATAR_HINT.search(anc_l) \
+            or _IG_PROFILE_PATH.search(path):
+        s += WI["avatar_like"]; feats.append("avatar")
+    if STATIC_ASSET_HINT.search(full):
+        s += WI["static_asset"]; feats.append("static")
+    if TRACKING_HINT.search(url):
+        s += WI["tracking"]; feats.append("track")
+
+    prov = f"{'/'.join(rc.ancestors[-3:])}::{rc.key} [{'+'.join(feats)}]"
+    return MediaCandidate(full, round(s, 1), "image", eff_h, eff_w, None,
+                          ext, None, prov, order=rc.order)
+
+
+def group_images(cands: list[MediaCandidate]) -> list[MediaCandidate]:
+    """Agrupa por `image_identity` (fusiona tamanos de la MISMA foto), elige
+    como representante el de MAYOR resolucion (y a igualdad, mayor puntaje), y
+    devuelve los grupos EN ORDEN DE DOCUMENTO — que es el orden del carrusel,
+    no el ranking por calidad. Esa distincion es la que hace que "bajame la 2 y
+    la 5" signifique lo mismo para el usuario que para el servidor."""
+    groups: dict[str, list[MediaCandidate]] = {}
+    for c in cands:
+        groups.setdefault(image_identity(c.url), []).append(c)
+
+    reps: list[MediaCandidate] = []
+    for members in groups.values():
+        best = max(members, key=lambda c: (max(c.height or 0, c.width or 0),
+                                           c.score, len(c.url)))
+        # El orden del grupo es el de su PRIMERA aparicion en el documento.
+        best.order = min(m.order for m in members)
+        # El puntaje del grupo es el del mejor miembro: si CUALQUIER rendition
+        # tenia evidencia fuerte (dims grandes, ancestro carousel), el grupo
+        # entero se beneficia. Evita perder una foto porque la variante que
+        # gano por tamano venia de una isla del HTML mas pobre en contexto.
+        best.score = max(m.score for m in members)
+        reps.append(best)
+
+    reps.sort(key=lambda c: c.order)
+    return reps[:MAX_IMAGES]
 
 
 # ==========================================================================
@@ -706,6 +1172,11 @@ class ResolveResult:
     formats: list = field(default_factory=list)   # MediaCandidate ordenados
     reason: str = ""
     diagnostics: dict = field(default_factory=dict)
+    # --- lo que agrega el pase de imagen / caption ---
+    images: list = field(default_factory=list)    # MediaCandidate en ORDEN
+    media_type: str = "none"                      # video|carousel|image|none
+    full_caption: str | None = None               # el texto COMPLETO del post
+    hashtags: list = field(default_factory=list)
 
     def to_info(self) -> dict:
         """Convierte a un 'info dict' estilo yt-dlp para que el server lo cure
@@ -734,16 +1205,113 @@ class ResolveResult:
             "thumbnail": self.thumbnail,
             "duration": self.duration,
             "formats": fmts,
+            # `description` con el nombre de yt-dlp: asi el server no necesita
+            # saber de donde vino el caption para mostrarlo.
+            "description": self.full_caption,
             "_cauce_resolver": True,
             "_cauce_strategy": self.strategy,
             "_cauce_confidence": self.confidence,
+            "_cauce_media_type": self.media_type,
+            "_cauce_hashtags": list(self.hashtags),
+            "_cauce_images": [{
+                "index": i + 1,                  # 1-based: lo que ve el humano
+                "url": c.url,
+                "width": c.width,
+                "height": c.height,
+                "ext": c.ext or "jpg",
+                "score": c.score,
+                "provenance": c.provenance,
+            } for i, c in enumerate(self.images)],
             "webpage_url": self.url,
         }
 
 
+# Claves de texto largo que suelen contener el CAPTION del post. LinkedIn lo
+# llama `commentary`, Instagram `edge_media_to_caption.edges[].node.text`,
+# schema.org `articleBody`/`description`, Facebook `message`.
+CAPTION_KEYS = ("caption", "description", "articlebody", "commentary",
+                "message", "text", "content", "summary", "title_text")
+
+# Basura tipica que las plataformas ponen en og:description cuando NO hay
+# caption real (la frase de relleno). Si el candidato es solo esto, no sirve.
+_CAPTION_NOISE = re.compile(
+    r"(?i)^\s*(\d+[\d.,]*\s*(likes?|me gusta|comments?|comentarios?|views?|"
+    r"reproducciones)\b.*){1,3}\s*$",
+)
+
+
+def _clean_caption(t) -> str | None:
+    if not isinstance(t, str):
+        return None
+    t = re.sub(r"\s+\n", "\n", t.replace("\r", "")).strip()
+    if len(t) < 12 or len(t) > 6000:
+        return None
+    if _CAPTION_NOISE.match(t):
+        return None
+    return t[:4000]
+
+
+def find_caption(metas: dict, json_trees: list) -> str | None:
+    """IMPLEMENTACION 1 (la del TXT): el CAPTION COMPLETO del post.
+
+    yt-dlp en Instagram devuelve "Video by <usuario>" y nada mas; el texto real
+    del post —el que dice de que trata— esta en el HTML, en og:description y en
+    el JSON embebido. Lo buscamos en las dos fuentes y nos quedamos con el MAS
+    LARGO que no sea relleno: mas largo = mas informacion para razonar.
+
+    Coste: CERO fetches extra. Ya bajamos ese HTML para buscar el video."""
+    cands: list[str] = []
+
+    for k in ("og:description", "twitter:description", "description",
+              "og:title", "twitter:title", "<title>"):
+        c = _clean_caption(metas.get(k))
+        if c:
+            cands.append(c)
+
+    def visit(node, depth=0):
+        if depth > 30:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and str(k).lower() in CAPTION_KEYS:
+                    c = _clean_caption(v)
+                    if c:
+                        cands.append(c)
+                else:
+                    visit(v, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                visit(v, depth + 1)
+
+    for tree in json_trees:
+        visit(tree)
+
+    if not cands:
+        return None
+    # El mas largo gana, pero con un desempate: preferimos el que trae saltos
+    # de linea o hashtags (senal de que es el texto del post y no un titulo).
+    return max(cands, key=lambda c: (len(c), "\n" in c, "#" in c))
+
+
+def extract_hashtags(text: str | None) -> list:
+    """Hashtags en orden de aparicion, sin repetir. Son el ancla mas barata
+    para que Claude sepa DE QUE trata el contenido sin ver el video."""
+    if not text:
+        return []
+    seen = set()
+    out = []
+    for h in re.findall(r"#([^\s#.,;:!?()\[\]{}\"']{2,60})", text):
+        k = h.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append("#" + h)
+    return out[:40]
+
+
 def _find_meta(dom_and_json, page_url) -> dict:
     """Saca titulo/uploader/miniatura/duracion recorriendo el JSON-LD y OG."""
-    dom_media, json_trees = dom_and_json
+    dom_media, json_trees = dom_and_json[0], dom_and_json[1]
+    metas = dom_and_json[2] if len(dom_and_json) > 2 else {}
     meta = {"title": None, "uploader": None, "thumbnail": None, "duration": None}
 
     # 1) JSON-LD estandar (schema.org VideoObject / SocialMediaPosting).
@@ -774,6 +1342,24 @@ def _find_meta(dom_and_json, page_url) -> dict:
 
     for tree in json_trees:
         visit(tree)
+
+    # FALLBACK A OPEN GRAPH. Antes solo miraramos el JSON-LD, y muchos sitios
+    # (Instagram, Pinterest, casi todo lo servido a un bot de vista previa) NO
+    # traen JSON-LD pero SI traen og:*. Es informacion gratis que teniamos
+    # delante y no estabamos leyendo.
+    meta["title"] = meta["title"] or metas.get("og:title") or \
+        metas.get("twitter:title") or metas.get("<title>")
+    meta["thumbnail"] = meta["thumbnail"] or metas.get("og:image") or \
+        metas.get("og:image:secure_url") or metas.get("twitter:image")
+    if not meta["uploader"]:
+        # `author` de Twitter cards y el patron "@usuario" del og:title.
+        au = metas.get("twitter:creator") or metas.get("author") or \
+            metas.get("article:author")
+        if isinstance(au, str) and au.strip():
+            meta["uploader"] = au.strip()
+    if meta["duration"] is None:
+        meta["duration"] = _parse_duration(metas.get("og:video:duration") or
+                                           metas.get("video:duration"))
     return meta
 
 
@@ -796,7 +1382,7 @@ def _parse_duration(d) -> int | None:
 def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResult:
     """NUCLEO PURO (sin red): dado el HTML, devuelve el resultado. Esto es lo
     que testeamos con fixtures — es determinista y no toca la red."""
-    dom_media, json_trees = iter_islands(html)
+    dom_media, json_trees, metas = iter_islands(html)
 
     raws: list[RawCandidate] = []
     # (a) media directa del DOM
@@ -804,10 +1390,17 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         raws.append(RawCandidate(
             url=_normalize_escaped(dm.url), key=dm.attrs.get("from", "src"),
             ancestors=("<dom>",), siblings=frozenset(dm.attrs.keys()),
-            sibling_obj=dm.attrs, depth=0, from_dom=True, dom_attrs=dm.attrs))
+            sibling_obj=dm.attrs, depth=0,
+            # Un <img> NO cobra el bono de "es un <video> real".
+            from_dom=not dm.is_img, dom_attrs=dm.attrs, is_img=dm.is_img))
     # (b) todo lo que haya en los arboles JSON
     for tree in json_trees:
         _walk(tree, tuple(), raws)
+
+    # Sellar el ORDEN DE DOCUMENTO. El DOM va primero y el DFS visita en orden
+    # de aparicion, asi que el indice en `raws` ES el orden del carrusel.
+    for i, rc in enumerate(raws):
+        rc.order = i
 
     scored: list[MediaCandidate] = []
     for rc in raws:
@@ -822,13 +1415,24 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     media.sort(key=lambda c: (c.kind == "audio", -(c.score), -(c.height or 0),
                               -(c.tbr or 0)))
 
-    meta = _find_meta((dom_media, json_trees), page_url)
+    # ---- PASE DE IMAGEN (carrusel / album / pin) -------------------------
+    # Mismo grafo, segundo modelo. No cuesta ni un fetch mas.
+    img_scored: list[MediaCandidate] = []
+    for rc in raws:
+        ic = score_image_candidate(rc, page_url)
+        if ic is not None:
+            img_scored.append(ic)
+    images = group_images([c for c in img_scored if c.score >= MIN_IMAGE_SCORE])
+
+    meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.
     if not meta.get("thumbnail"):
-        imgs = sorted((c for c in scored if c.kind == "image"),
-                      key=lambda c: -c.score)
-        if imgs:
-            meta["thumbnail"] = imgs[0].url
+        best_img = max(img_scored, key=lambda c: c.score, default=None)
+        if best_img is not None:
+            meta["thumbnail"] = best_img.url
+
+    caption = find_caption(metas, json_trees)
+    hashtags = extract_hashtags(caption)
 
     # Confianza: satura el puntaje del ganador y lo mezcla con su margen sobre
     # el 2do archivo DISTINTO. Alta cuando el ganador es claro y bien puntuado.
@@ -841,7 +1445,24 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
             margin = min(1.0, max(0.0, (top - media[1].score) / 40.0))
         conf = round(0.7 * sat + 0.3 * (0.5 + 0.5 * margin), 3)
 
-    ok = bool(media)
+    # Sin video pero CON fotos, la confianza la marca el pase de imagen.
+    if not media and images:
+        top_i = max(c.score for c in images)
+        conf = round(min(1.0, top_i / 100.0) * 0.85, 3)
+
+    # QUE ES ESTO: la respuesta que Claude necesita para no adivinar mirando
+    # el link. `video` manda si hay algo reproducible (el usuario que comparte
+    # un reel quiere el reel); si no hay video, 2+ fotos = carrusel.
+    if media:
+        media_type = "video"
+    elif len(images) >= 2:
+        media_type = "carousel"
+    elif images:
+        media_type = "image"
+    else:
+        media_type = "none"
+
+    ok = bool(media or images)
     reason = "" if ok else (
         "No encontre ninguna URL de medio en el HTML. Probablemente el "
         "contenido exige inicio de sesion, o la pagina carga el video por "
@@ -851,10 +1472,15 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         title=meta.get("title"), uploader=meta.get("uploader"),
         thumbnail=meta.get("thumbnail"), duration=meta.get("duration"),
         formats=media, reason=reason,
+        images=images, media_type=media_type,
+        full_caption=caption, hashtags=hashtags,
         diagnostics={
             "dom_media": len(dom_media), "json_trees": len(json_trees),
             "raw_candidates": len(raws), "scored_media": len(scored),
+            "scored_images": len(img_scored), "images_kept": len(images),
+            "media_type": media_type,
             "top_scores": [(c.url[:80], c.score, c.height) for c in media[:5]],
+            "top_images": [(c.url[:80], c.score, c.width, c.height) for c in images[:5]],
         },
     )
 
@@ -898,7 +1524,7 @@ def _http_get(url: str, ua: str, *, max_bytes: int, referer: str | None = None) 
 
 
 def resolve(url: str, *, profile: Profile | None = None,
-            fetch=_http_get) -> ResolveResult:
+            fetch=_http_get, max_attempts: int = MAX_ATTEMPTS) -> ResolveResult:
     """Resuelve un enlace de verdad (con red). Construye la lista de intentos
     (URL original + reescrituras) x (User-Agents del perfil), la REORDENA segun
     la memoria por-host (lo que gano la ultima vez va primero), y se queda con
@@ -918,24 +1544,40 @@ def resolve(url: str, *, profile: Profile | None = None,
         except Exception:
             pass
 
+    # ORDEN ROUND-ROBIN POR PUERTA, no por objetivo. Es decir:
+    #   original+googlebot, embed+googlebot, original+bingbot, embed+bingbot...
+    # y NO: original x las 6 puertas, y recien despues el embed.
+    # Motivo: cuando el original esta tras login-wall, la REESCRITURA (el
+    # /embed/ de LinkedIn, el /embed/captioned/ de Instagram) suele ser mucho
+    # mas determinante que insistir con otra puerta sobre la misma pagina. Asi
+    # el tope de intentos se gasta en las combinaciones que mas informacion
+    # nueva aportan.
     attempts: list[dict] = []
     seen = set()
-    for is_rw, group in ((False, [url]), (True, rewrites)):
-        for t in group:
-            for ua in profile.user_agents:
-                k = (t, ua)
-                if k in seen:
-                    continue
-                seen.add(k)
-                attempts.append({
-                    "target": t, "ua": ua, "is_rw": is_rw,
-                    "ua_kind": "googlebot" if "Googlebot" in ua else "browser",
-                })
+    targets = [(False, url)] + [(True, t) for t in rewrites]
+    for ua_rank, ua in enumerate(profile.user_agents):
+        for tgt_rank, (is_rw, t) in enumerate(targets):
+            k = (t, ua)
+            if k in seen:
+                continue
+            seen.add(k)
+            attempts.append({
+                "target": t, "ua": ua, "is_rw": is_rw,
+                "ua_kind": ua_kind(ua),
+                "rank": (ua_rank, tgt_rank),
+            })
+    attempts.sort(key=lambda a: a["rank"])
 
-    # Auto-sanacion: si recordamos que clase gano en este host, va PRIMERO.
+    # Auto-sanacion: si recordamos que puerta gano en este host, va PRIMERO.
+    # Guardamos la puerta CONCRETA (no solo "bot vs navegador"): si el dia que
+    # LinkedIn cierre Googlebot resulta que Slackbot sigue abierto, la memoria
+    # aprende sola a liderar con Slackbot sin que nadie toque el codigo.
     remembered = _HOST_MEMORY.get(host)
     if remembered:
         attempts.sort(key=lambda a: 0 if (a["is_rw"], a["ua_kind"]) == remembered else 1)
+
+    if max_attempts and max_attempts > 0:
+        attempts = attempts[:max_attempts]
 
     best: ResolveResult | None = None
     for a in attempts:
@@ -950,6 +1592,26 @@ def resolve(url: str, *, profile: Profile | None = None,
         strat = f"{profile.name}:{a['ua_kind']}:{'embed' if a['is_rw'] else 'original'}"
         res = resolve_html(html, a["target"], strategy=strat)
         res.url = url  # reportamos siempre la URL original que dio el usuario
+
+        # MEZCLA DE PUERTAS: una puerta puede darnos el video y otra el caption
+        # completo (Googlebot ve el SSR; el /embed/captioned/ trae el texto).
+        # Nos quedamos con lo MEJOR de cada intento en vez de descartar el
+        # anterior entero. Es gratis y sube la calidad del resultado final.
+        if best is not None:
+            if not res.full_caption and best.full_caption:
+                res.full_caption = best.full_caption
+                res.hashtags = best.hashtags
+            if not res.thumbnail and best.thumbnail:
+                res.thumbnail = best.thumbnail
+            if not res.title and best.title:
+                res.title = best.title
+            if not res.images and best.images:
+                res.images = best.images
+                # Si este intento no encontro NADA propio, hereda tambien la
+                # etiqueta; si encontro video, "video" manda y no se toca.
+                if res.media_type in ("none", "image"):
+                    res.media_type = best.media_type
+
         if best is None or res.confidence > best.confidence or (res.ok and not best.ok):
             best = res
         if res.ok and res.confidence >= 0.6:
@@ -967,6 +1629,24 @@ _SELFTEST_HTML = (
 )
 
 
+# Carrusel minimo con la forma real de un sidecar de Instagram: DOS fotos, cada
+# una en dos tamanos, mas un avatar de perfil (t51.2885-19) que NO debe colarse.
+_SELFTEST_CAROUSEL_HTML = (
+    '<meta property="og:description" content="Probando el carrusel #uno #dos">'
+    '<img src="https://scontent.cdninstagram.com/v/t51.2885-19/'
+    'avatar_150x150.jpg?_nc=1">'
+    '<script type="application/json">'
+    '{"edge_sidecar_to_children":{"edges":['
+    '{"node":{"display_url":"https://scontent.cdninstagram.com/v/t51.2885-15/'
+    's640x640/111111_222222_333333_n.jpg?_nc=a","display_resources":['
+    '{"src":"https://scontent.cdninstagram.com/v/t51.2885-15/p1080x1080/'
+    '111111_222222_333333_n.jpg?_nc=a","config_width":1080,"config_height":1080}]}},'
+    '{"node":{"display_url":"https://scontent.cdninstagram.com/v/t51.2885-15/'
+    'p1080x1080/444444_555555_666666_n.jpg?_nc=b","width":1080,"height":1350}}'
+    ']}}</script>'
+)
+
+
 def selftest() -> bool:
     """Canario OFFLINE y determinista para el health_check: corre el motor
     contra un HTML minimo y verifica que EXTRAE la URL del CDN correctamente.
@@ -980,18 +1660,45 @@ def selftest() -> bool:
         return False
 
 
-def fetch_thumbnail_bytes(url: str, *, referer: str | None = None) -> tuple[bytes, str] | None:
-    """Baja los BYTES de una miniatura (para devolversela a Claude como imagen).
-    Solo tiene sentido desde el telefono (IP residencial que SI llega al CDN).
-    Devuelve (bytes, content_type) o None."""
+def selftest_carousel() -> bool:
+    """Canario OFFLINE del pase de IMAGEN: dos fotos distintas, en orden, sin
+    el avatar, y fusionando los dos tamanos de la primera en una sola."""
+    try:
+        r = resolve_html(_SELFTEST_CAROUSEL_HTML,
+                         "https://www.instagram.com/p/ABC123/")
+        if r.media_type != "carousel" or len(r.images) != 2:
+            return False
+        if any("avatar" in c.url for c in r.images):
+            return False
+        # la 1a foto debe salir en su version GRANDE (p1080x1080), no la chica
+        if "p1080x1080" not in r.images[0].url:
+            return False
+        return "111111" in r.images[0].url and "444444" in r.images[1].url
+    except Exception:
+        return False
+
+
+def fetch_image_bytes(url: str, *, referer: str | None = None,
+                      max_bytes: int = _MAX_IMAGE_BYTES) -> tuple[bytes, str] | None:
+    """Baja los BYTES de una imagen del CDN. Solo tiene sentido desde el
+    telefono (IP residencial que SI llega a fbcdn/licdn, que la red de Claude
+    tiene vetada). Devuelve (bytes, content_type) o None.
+
+    El `Referer` importa: varios CDN devuelven 403 sin el del sitio de origen."""
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": _BROWSER_UA,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             **({"Referer": referer} if referer else {}),
         })
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
-            data = r.read(_MAX_THUMB_BYTES)
+            data = r.read(max_bytes)
             ctype = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
         return (data, ctype) if data else None
     except Exception:
         return None
+
+
+def fetch_thumbnail_bytes(url: str, *, referer: str | None = None) -> tuple[bytes, str] | None:
+    """Alias historico de `fetch_image_bytes` (lo usa preview_thumbnail)."""
+    return fetch_image_bytes(url, referer=referer, max_bytes=_MAX_THUMB_BYTES)

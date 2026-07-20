@@ -518,6 +518,66 @@ def main():
     ok &= check("el caption SI conserva el texto real",
                 r_.full_caption and "Jalapeno" in r_.full_caption)
 
+    print("\n=== S. EL ANCLA: generaliza sin conocer la plataforma ===")
+    # Firmas REALES capturadas en vivo. anchor_affinity no sabe que es
+    # "feedshare" ni que es Instagram: solo compara la forma de la URL.
+    li_anchor = ("https://media.licdn.com/dms/image/v2/D5622AQF-wmKFPe2xdg/"
+                 "feedshare-shrink_800/B56Z750Bn_IQAc-/0/1782307626233?e=1")
+    li_otra = ("https://media.licdn.com/dms/image/v2/D4E22AQH2Kp-tS4b5Pg/"
+               "feedshare-image-high-res/B4EZ92N19_JYAU-/0/1784394768540?e=1")
+    li_avatar = ("https://media.licdn.com/dms/image/v2/D4D03AQHfWVqf-HH67g/"
+                 "profile-displayphoto-scale_400_400/B4E/0/1700000000001?e=1")
+    li_preview = ("https://media.licdn.com/dms/image/v2/D563DAQEiLbFUDLFr1g/"
+                  "image-scale_191_1128/image-scale_191_1128/0/1700000000003?e=1")
+    for nombre, u, esperado in (
+            ("otra feedshare", li_otra, True),
+            ("avatar de perfil", li_avatar, False),
+            ("vista previa de enlace", li_preview, False)):
+        af = R.anchor_affinity(u, li_anchor)
+        print(f"    LinkedIn {nombre:24} afinidad={af}")
+        ok &= check(f"LinkedIn: {nombre} -> {'cerca' if esperado else 'lejos'} del ancla",
+                    (af >= R.ANCHOR_MIN_AFFINITY) == esperado)
+
+    ig_anchor = ("https://scontent.cdninstagram.com/v/t51.82787-15/"
+                 "750755233_17938923786276987_7558221027793493537_n.jpg?stp=x")
+    ig_hermana = ("https://instagram.flim38-1.fna.fbcdn.net/v/t51.82787-15/"
+                  "749542545_17938923798276987_7501157_n.jpg?stp=x")
+    ig_otropost = ("https://scontent.cdninstagram.com/v/t51.82787-15/"
+                   "543756751_17898130368276987_8489574_n.jpg?stp=x")
+    for nombre, u, esperado in (
+            ("foto hermana del post", ig_hermana, True),
+            ("foto de OTRO post", ig_otropost, False)):
+        af = R.anchor_affinity(u, ig_anchor)
+        print(f"    Instagram {nombre:23} afinidad={af}")
+        ok &= check(f"Instagram: {nombre} -> {'cerca' if esperado else 'lejos'}",
+                    (af >= R.ANCHOR_MIN_AFFINITY) == esperado)
+
+    print("\n=== T. El ancla actua cuando NO hay contenedor ni rendition ===")
+    # Plataforma imaginaria: ni contenedor JSON ni nombres que conozcamos.
+    # Solo <img> sueltos. El ancla tiene que bastar para separar el grano.
+    DESCONOCIDA = (
+        '<meta property="og:image" content="https://cdn.plataforma-nueva.com/'
+        'media/9001234567890123_a.jpg">'
+        '<img src="https://cdn.plataforma-nueva.com/media/9001234567891456_b.jpg">'
+        '<img src="https://cdn.plataforma-nueva.com/media/9001234567892789_c.jpg">'
+        '<img src="https://cdn.plataforma-nueva.com/media/1200000000000001_z.jpg">'
+    )
+    t_ = R.resolve_html(DESCONOCIDA, "https://plataforma-nueva.com/post/1")
+    for c in t_.images:
+        print(f"    [{c.score:6.1f}] {c.url[-28:]}")
+    ok &= check("conserva las 3 del post (IDs vecinos del ancla)",
+                len(t_.images) == 3)
+    ok &= check("descarta la de ID lejano (otro post)",
+                not any("1200000000000001" in c.url for c in t_.images))
+
+    print("\n=== U. Esloganes de plataforma rechazados como caption ===")
+    ok &= check("Pinterest (italiano)",
+                R.clean_caption("Scopri (e salva) i tuoi Pin su Pinterest.") is None)
+    ok &= check("Pinterest (espanol)",
+                R.clean_caption("Descubre (y guarda) tus propios Pines en Pinterest") is None)
+    ok &= check("un caption REAL no se descarta",
+                R.clean_caption("Receta de pan de masa madre con 18 horas de fermentacion"))
+
     print("\n=== J. selftests offline del health_check ===")
     ok &= check("selftest() (video) OK", R.selftest())
     ok &= check("selftest_carousel() (fotos) OK", R.selftest_carousel())

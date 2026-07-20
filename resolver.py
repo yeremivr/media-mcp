@@ -94,8 +94,8 @@ import re
 import zlib
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Iterable, Iterator
-from urllib.parse import urlparse, urljoin, parse_qs
+from typing import Iterator
+from urllib.parse import urlparse, urljoin
 import urllib.request
 import urllib.error
 
@@ -114,7 +114,8 @@ MEDIA_CDN_HOSTS = re.compile(
     | [\w.-]*\.fbcdn\.net             # Facebook / Instagram video
     | [\w.-]*\.cdninstagram\.com      # Instagram
     | scontent[\w.-]*\.(?:fbcdn\.net|cdninstagram\.com)
-    | video[\w.-]*\.twimg\.com        # Twitter / X
+    | video[\w.-]*\.twimg\.com        # Twitter / X (video)
+    | pbs\.twimg\.com                 # Twitter / X (imagenes)
     | [\w.-]*\.tiktokcdn[\w.-]*\.com  # TikTok
     | [\w.-]*\.tiktokv\.com
     | [\w.-]*\.muscdn\.com
@@ -1184,7 +1185,112 @@ def score_image_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | N
                           is_post_media=("carousel" in feats or "content" in feats))
 
 
-def keep_authoritative(cands: list[MediaCandidate]) -> list[MediaCandidate]:
+# ==========================================================================
+# EL ANCLA  (la generalizacion que evita seguir aprendiendo vocabulario)
+# ==========================================================================
+# Todo lo anterior —contenedores, renditions— exigio que yo supiera como llama
+# CADA plataforma a sus cosas: carousel_media, feedshare, t51.2885-15,
+# profile-displayphoto. Eso es exactamente la fragilidad que este motor existe
+# para evitar: es un extractor-por-sitio disfrazado, y con cada plataforma
+# nueva hay que volver a aprender su jerga.
+#
+# LA SALIDA: cada pagina nos regala un EJEMPLO ETIQUETADO y no lo estabamos
+# usando. `og:image` es, por CONTRATO, el medio propio del post — el mismo
+# contrato de vista-previa-de-enlace que hace funcionar la cascada de puertas.
+# Ninguna plataforma puede romperlo sin que sus enlaces se vean rotos en cada
+# chat del mundo.
+#
+# Asi que en vez de codificar vocabulario, se APRENDE LA FIRMA DEL ANCLA en
+# tiempo de ejecucion y se conserva lo que se le parece. Dos rasgos bastan, y
+# ninguno depende del nombre de la plataforma:
+#
+#   1. FAMILIA DE RENDITION: el prefijo alfabetico del segmento de ruta.
+#      LinkedIn -> el ancla es `feedshare-...`; `profile-displayphoto-...` es
+#      otra familia. Funciona sin saber que significa "feedshare".
+#   2. PARENTESCO DE ID: las plataformas usan identificadores tipo snowflake
+#      (con marca de tiempo al principio) y los medios de UN MISMO post se
+#      suben juntos -> sus IDs son VECINOS. Los de otro post divergen enseguida.
+#      Instagram real: 17938923786... / 17938923798... (9 digitos comunes).
+#      Instagram intruso: 17898130368... (2 digitos comunes). Es aritmetica,
+#      no vocabulario.
+
+ANCHOR_MIN_AFFINITY = 0.5
+
+
+def _host_family(url: str) -> str:
+    """Los dos ultimos labels del host: licdn.com, cdninstagram.com, pinimg.com."""
+    h = (urlparse(url).hostname or "").lower()
+    return ".".join(h.split(".")[-2:]) if h else ""
+
+
+def _family_tokens(url: str) -> frozenset:
+    """Prefijos alfabeticos de los segmentos de ruta que nombran una FAMILIA.
+    `feedshare-shrink_800` -> feedshare. `profile-displayphoto-x` -> profile.
+    Los segmentos que son puro id/hash/tamano no aportan (no tienen prefijo
+    alfabetico de 3+ letras seguido de separador)."""
+    out = set()
+    for seg in urlparse(url).path.split("/"):
+        m = re.match(r"(?i)^([a-z]{3,})[-_.]", seg)
+        if m:
+            out.add(m.group(1).lower())
+    return frozenset(out)
+
+
+def _media_ids(url: str) -> list:
+    """Tokens largos del basename que parecen identificadores."""
+    base = urlparse(url).path.rsplit("/", 1)[-1]
+    return [t for t in re.split(r"[^A-Za-z0-9]+", base) if len(t) >= 8]
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def anchor_affinity(url: str, anchor: str | None) -> float:
+    """0..1 — cuanto se PARECE estructuralmente `url` al ancla (og:image).
+
+    No mira el contenido ni el nombre de la plataforma: solo la forma de la
+    URL. Verificado contra las 5 plataformas capturadas en vivo."""
+    if not anchor or not url:
+        return 0.0
+    a = 0.0
+
+    if _host_family(url) and _host_family(url) == _host_family(anchor):
+        a += 0.25
+
+    fam_u, fam_a = _family_tokens(url), _family_tokens(anchor)
+    if fam_a:
+        # El ancla declara familia: pertenecer a ella suma; ser de OTRA resta.
+        a += 0.45 if (fam_u & fam_a) else -0.35
+
+    best = 0
+    for x in _media_ids(url):
+        for y in _media_ids(anchor):
+            best = max(best, _common_prefix_len(x, y))
+    # El parentesco de ID pesa MAS que el host, y a proposito: un host puede
+    # cambiar sin que cambie el contenido (Instagram sirve la MISMA foto desde
+    # cdninstagram.com y desde fbcdn.net, misma red de Meta), mientras que 9+
+    # caracteres iniciales comunes en un identificador global no son
+    # casualidad. Por eso este rasgo basta por si solo para alcanzar el umbral:
+    # la alternativa era codificar "estos dos hosts son primos", que es
+    # justamente el vocabulario-por-plataforma del que queremos escapar.
+    if best >= 12:
+        a += 0.60
+    elif best >= 9:
+        a += 0.50
+    elif best >= 6:
+        a += 0.15
+
+    return max(0.0, min(1.0, round(a, 3)))
+
+
+def keep_authoritative(cands: list[MediaCandidate],
+                       anchor: str | None = None) -> list[MediaCandidate]:
     """SI hay evidencia POSITIVA de cuales son los medios DEL POST, esos mandan
     y todo lo demas sobra.
 
@@ -1203,11 +1309,28 @@ def keep_authoritative(cands: list[MediaCandidate]) -> list[MediaCandidate]:
     CDN, firmados, dimensiones plausibles. Solo los separa saber que el archivo
     fue puesto ahi PARA ESTE POST.
 
-    Regla: si ALGUN candidato tiene esa evidencia, se conservan solo esos. Si
-    NINGUNO la tiene (Pinterest, blogs, HTML plano), no hay autoridad a la que
-    deferir y se conservan todos."""
+    Regla, en tres escalones de menor a mayor generalidad:
+
+      1. EVIDENCIA EXPLICITA (contenedor o rendition de contenido). Es la mas
+         fuerte porque la plataforma la declara; si existe, manda.
+      2. EL ANCLA (`og:image`). Cuando la plataforma no nos da ni contenedor ni
+         un nombre de rendition que reconozcamos —o sea, en CUALQUIER
+         plataforma que todavia no hemos visto— se aprende la firma del ancla y
+         se conserva lo que se le parece. Este escalon es el que evita tener
+         que seguir aprendiendo vocabulario plataforma por plataforma.
+      3. Si no hay ni una cosa ni la otra, no hay autoridad a la que deferir y
+         se conserva todo (Pinterest, blogs, HTML plano)."""
     authoritative = [c for c in cands if c.is_post_media]
-    return authoritative if authoritative else cands
+    if authoritative:
+        return authoritative
+
+    if anchor:
+        near = [c for c in cands
+                if anchor_affinity(c.url, anchor) >= ANCHOR_MIN_AFFINITY]
+        if near:
+            return near
+
+    return cands
 
 
 def group_images(cands: list[MediaCandidate]) -> list[MediaCandidate]:
@@ -1386,8 +1509,31 @@ _SOCIAL_TAIL = re.compile(
     r"(?:\s+on\s+\w+)?\s*\.?\s*$")
 
 
+# ESLOGANES DE PLATAFORMA: texto identico en CADA pagina del sitio, que no
+# dice nada del contenido. Pinterest devuelve su tagline traducido ("Scopri (e
+# salva) i tuoi Pin su Pinterest."), Facebook e Instagram tienen los suyos.
+# Rechazarlos es de bajo riesgo: solo descartamos ruido, nunca contenido.
+_BOILERPLATE = re.compile(
+    r"(?i)^\s*("
+    r"(scopri|discover|descubre|d[ée]couvrez|entdecke|descobre|ontdek)\b[^.]{0,60}"
+    r"\bpin(e?s)?\b[^.]{0,40}\bpinterest"
+    r"|see\s+(posts|photos)[^.]{0,60}\b(facebook|instagram)"
+    r"|log\s+in\s+or\s+sign\s+up"
+    r"|(inicia\s+sesi[óo]n|reg[íi]strate)\b"
+    r"|\d+[\d.,]*[KMB]?\s+(followers?|seguidores)\b"
+    r")")
+
+
+def clean_caption(t) -> str | None:
+    """Version PUBLICA: limpia un caption venga de donde venga (tambien del
+    `description` de yt-dlp, que el server usa en la via rapida)."""
+    return _clean_caption(t)
+
+
 def _clean_caption(t) -> str | None:
     if not isinstance(t, str):
+        return None
+    if _BOILERPLATE.match(t.strip()):
         return None
     t = re.sub(r"\s+\n", "\n", t.replace("\r", "")).strip()
     # Puede haber mas de una metrica encadenada al final.
@@ -1409,8 +1555,8 @@ def _clean_caption(t) -> str | None:
 # ESTA publicacion — que es justo el que hay que preferir sobre cualquier otro
 # texto largo del documento.
 _OG_TITLE_WRAPPER = re.compile(
-    r'(?is)^\s*(.{1,80}?)\s+on\s+(?:instagram|facebook|threads|linkedin)\s*:\s*'
-    r'[\"“”](.*?)[\"“”]\s*$')
+    r'(?is)^\s*(.{1,80}?)\s+on\s+(?:instagram|facebook|threads|linkedin|x|'
+    r'twitter)\s*:\s*[\"“”](.*?)[\"“”]\s*(?:/\s*\w{1,10}\s*)?$')
 
 
 # El og:description de Instagram envuelve el caption en estadisticas:
@@ -1673,8 +1819,13 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         ic = score_image_candidate(rc, page_url)
         if ic is not None:
             img_scored.append(ic)
+    # El ANCLA: og:image es, por contrato de vista previa, un medio DEL POST.
+    # Es el ejemplo etiquetado que la propia pagina nos regala.
+    anchor = (metas.get("og:image") or metas.get("og:image:secure_url")
+              or metas.get("twitter:image"))
     images = group_images(
-        keep_authoritative([c for c in img_scored if c.score >= MIN_IMAGE_SCORE]))
+        keep_authoritative([c for c in img_scored if c.score >= MIN_IMAGE_SCORE],
+                           anchor=anchor))
 
     meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.

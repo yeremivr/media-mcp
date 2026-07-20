@@ -1005,7 +1005,12 @@ def list_formats(url: str) -> dict:
     # Caption completo tambien por la via de yt-dlp: su `description` ya trae
     # el texto del post en Facebook/TikTok/YouTube. Es informacion que estaba
     # ahi y no exponiamos, y le ahorra a Claude tener que adivinar el tema.
-    caption = info.get("description") or None
+    # Se limpia con el MISMO criterio que el resolver: yt-dlp devuelve tal cual
+    # lo que ponga la pagina, incluidos los esloganes genericos de plataforma
+    # (Pinterest: "Scopri (e salva) i tuoi Pin su Pinterest.", identico en cada
+    # pin y sin ninguna informacion del contenido).
+    caption = (_resolver.clean_caption(info.get("description"))
+               if _resolver else (info.get("description") or None))
     hashtags = _resolver.extract_hashtags(caption) if _resolver else []
 
     # LIMITE HONESTO: si yt-dlp resolvio el enlace, NO sabemos si el post tenia
@@ -1035,6 +1040,74 @@ def list_formats(url: str) -> dict:
         "hashtags": hashtags,
         "js_engine": "deno" if DENO_PATH else "none",
     }
+
+
+@mcp.tool()
+def grab(url: str, quality: str = "best", which: str = "all") -> dict:
+    """
+    UN SOLO PASO: mira el enlace, decide QUE ES y lo descarga. Sin preguntar.
+
+    ESTA ES LA HERRAMIENTA POR DEFECTO cuando el usuario comparte un enlace y
+    NO pide nada en concreto — por ejemplo si solo pega el link, o dice
+    "bajame esto", "guardalo", "descarga". Usala directamente: NO llames antes
+    a list_formats. Este es el caso comun y esta pensado para que el usuario
+    pueda pegar el link y cerrar la app.
+
+    Que hace por dentro:
+      * Si el enlace es un VIDEO   -> lo baja en la MAXIMA calidad disponible.
+      * Si es un CARRUSEL o FOTO   -> baja TODAS las imagenes.
+      * Todo en segundo plano, a la galeria del telefono, con notificacion.
+
+    Cuando NO usar esta herramienta (usa las especificas):
+      * El usuario pide una calidad concreta -> list_formats + download.
+      * El usuario quiere elegir fotos sueltas -> list_formats + download_images.
+      * El usuario solo quiere SABER que es, sin bajar nada -> list_formats.
+
+    Args:
+        url: el enlace compartido.
+        quality: "best" (por defecto) o "worst" para la mas ligera. Solo aplica
+                 a video; se ignora en fotos.
+        which: que fotos bajar si resulta ser un carrusel. "all" por defecto.
+    """
+    try:
+        info = _extract_info(url)
+    except Exception as e:
+        return _friendly_error(e)
+
+    curated = (_curate_resolver(info) if info.get("_cauce_resolver")
+               else None)
+
+    # --- Caso FOTOS: el resolver ya dijo que hay carrusel/imagen ---
+    if curated and curated.get("image_count"):
+        res = download_images(url, which)
+        res["media_type"] = curated.get("media_type")
+        res["title"] = res.get("title") or curated.get("title")
+        res["full_caption"] = curated.get("full_caption")
+        res["uploader"] = curated.get("uploader")
+        return res
+
+    # --- Caso VIDEO ---
+    listing = curated or list_formats(url)
+    fmts = [f for f in (listing.get("formats") or []) if f.get("kind") == "video"]
+    if not fmts:
+        fmts = [f for f in (listing.get("formats") or []) if f.get("kind") == "audio"]
+    if not fmts:
+        # Ni video ni fotos: puede ser un post de solo texto o pedir login.
+        return {"ok": False, "media_type": listing.get("media_type", "none"),
+                "error": "No encontre nada descargable en ese enlace "
+                         "(puede ser solo texto, o exigir inicio de sesion).",
+                "title": listing.get("title"),
+                "full_caption": listing.get("full_caption")}
+
+    # `formats` viene ordenado de mayor a menor calidad desde list_formats.
+    chosen = fmts[-1] if str(quality).lower() in ("worst", "peor", "baja") else fmts[0]
+    res = download(url, chosen["format_id"])
+    res["media_type"] = listing.get("media_type")
+    res["quality"] = chosen.get("label")
+    res["title"] = res.get("title") or listing.get("title")
+    res["full_caption"] = listing.get("full_caption")
+    res["uploader"] = listing.get("uploader")
+    return res
 
 
 @mcp.tool()

@@ -7,8 +7,11 @@ Herramientas MCP para Claude (capa de razonamiento):
   - download_status(job_id?): estado de una descarga (o de las ultimas)
   - resolve_media(url): resuelve con el MOTOR ESTRUCTURAL (grafo+scoring), util
        para LinkedIn/Facebook/sitios sin extractor, con diagnostico transparente
+  - download_images(url, which): baja las FOTOS de un carrusel/album/pin
+       ("all" o una seleccion tipo "1,3,5" / "2-4")
   - preview_thumbnail(url): baja la miniatura y la devuelve como IMAGEN (Claude
        la ve) — funciona porque el telefono SI llega al CDN que Claude tiene vetado
+  - preview_image(url, index): igual, pero de una FOTO concreta del carrusel
   - health_check(): estado de yt-dlp + del resolver
 
 RED DE SEGURIDAD ESTRUCTURAL (resolver.py): cuando yt-dlp no tiene extractor o
@@ -47,6 +50,7 @@ telefono con Termux). Este server es PORTABLE (Termux / PC / Render) y anade:
 """
 
 import os
+import re
 import json
 import uuid
 import time
@@ -728,6 +732,133 @@ def _download_worker(job: dict):
                 icon="error_outline")
 
 
+# ==========================================================================
+# DESCARGA DE FOTOS (carruseles / albumes / pines)
+# ==========================================================================
+# Una foto NO necesita yt-dlp: es un GET a un CDN. Bajarlas nosotros con
+# urllib es mas rapido, no arranca subprocesos y no depende de que yt-dlp
+# tenga extractor para ese sitio. Lo unico que importa de verdad es que el
+# telefono (IP residencial) SI llega a fbcdn/licdn/pinimg.
+
+_SAFE_NAME = re.compile(r"[^\w\-. ]+", re.U)
+
+# Plataformas donde un mismo enlace puede traer varias fotos ademas del video.
+_CAROUSEL_CAPABLE = re.compile(
+    r"(?i)(instagram\.com|facebook\.com|fb\.watch|linkedin\.com|"
+    r"pinterest\.[\w.]+|pin\.it|threads\.net|x\.com|twitter\.com)$")
+
+
+def _safe_stem(title: str | None, fallback: str = "cauce") -> str:
+    """Nombre de archivo seguro para el almacenamiento del telefono."""
+    t = _SAFE_NAME.sub("", (title or "").strip())[:60].strip() or fallback
+    return t.replace(" ", "_")
+
+
+def parse_selection(which: str, n: int) -> list:
+    """Traduce lo que dijo el humano a indices concretos (1-based).
+
+    Acepta "all"/"todas"/"" (todas), "1,3,5", "2-4", "1-3,7", "ultima"/"last".
+    Ignora lo que no exista en vez de reventar: si pide la 9 de un carrusel de
+    5, se baja lo que si hay y se le avisa. Robusto a proposito: el input viene
+    de una persona hablando, no de un formulario."""
+    if n <= 0:
+        return []
+    w = (which or "").strip().lower()
+    if w in ("", "all", "todas", "todos", "toda", "todo", "*", "everything"):
+        return list(range(1, n + 1))
+    if w in ("last", "ultima", "última", "la ultima", "la última"):
+        return [n]
+    if w in ("first", "primera", "la primera"):
+        return [1]
+    out: list = []
+    for part in re.split(r"[,;/ ]+", w):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)\s*[-–a]\s*(\d+)$", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            out.extend(range(min(a, b), max(a, b) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+    seen = set()
+    picked = []
+    for i in out:
+        if 1 <= i <= n and i not in seen:
+            seen.add(i)
+            picked.append(i)
+    return picked
+
+
+def _download_images_worker(job: dict):
+    """Baja las fotos elegidas, una a una, y notifica UNA vez al final.
+
+    RE-RESUELVE el enlace en el momento: igual que con el video, las URLs de
+    los CDN vienen FIRMADAS y con expiracion, asi que la que se mostro en
+    `list_formats` puede estar muerta cuando el usuario decide bajarla."""
+    job_id = job["job_id"]
+    url = job["url"]
+    try:
+        res = _resolver.resolve(url)
+        imgs = list(getattr(res, "images", []) or [])
+        if not imgs:
+            raise RuntimeError(res.reason or
+                               "No encontre fotos descargables en ese enlace.")
+
+        picked = parse_selection(job.get("which") or "all", len(imgs))
+        if not picked:
+            raise RuntimeError(
+                f"Ese enlace tiene {len(imgs)} foto(s) y la seleccion "
+                f"'{job.get('which')}' no coincide con ninguna.")
+
+        stem = _safe_stem(res.title, f"cauce_{job_id}")
+        files, errors = [], []
+        for i in picked:
+            cand = imgs[i - 1]
+            got = _resolver.fetch_image_bytes(cand.url, referer=url)
+            if not got:
+                errors.append(i)
+                continue
+            data, ctype = got
+            ext = "png" if "png" in (ctype or "") else (
+                "webp" if "webp" in (ctype or "") else "jpg")
+            # El numero va en el nombre para que la galeria las ordene igual
+            # que el carrusel original.
+            dst = DOWNLOAD_DIR / f"{stem}_{i:02d}_{job_id}.{ext}"
+            dst.write_bytes(data)
+            files.append(str(dst))
+            _media_scan(str(dst))
+
+        if not files:
+            raise RuntimeError("Encontre las fotos pero el CDN no me dejo "
+                               "bajar ninguna (pueden haber expirado).")
+
+        job.update({
+            "status": "done",
+            "title": res.title or f"{len(files)} foto(s)",
+            "thumbnail": res.thumbnail,
+            "uploader": res.uploader,
+            "file_path": files[0],
+            "files": files,
+            "downloaded": len(files),
+            "requested": len(picked),
+            "failed": errors,
+            "updated_at": _now(),
+        })
+        _upsert_job(job)
+
+        bits = [f"{len(files)} de {len(imgs)} fotos"]
+        if res.uploader:
+            bits.insert(0, res.uploader)
+        bits.append("Guardadas en tu galería")
+        _notify(job_id, res.title or "Fotos descargadas", "  ·  ".join(bits),
+                filepath=files[0], image_path=files[0], icon="photo_library")
+    except Exception as e:
+        job.update({"status": "error", "error": str(e), "updated_at": _now()})
+        _upsert_job(job)
+        _notify(job_id, "No se pudieron descargar las fotos", str(e)[:120],
+                icon="error_outline")
+
+
 def _curate_resolver(info: dict) -> dict:
     """Cura la salida del resolver estructural al MISMO esquema que list_formats
     (title/uploader/thumbnail/formats[{format_id,kind,label,filesize_mb}]) para
@@ -763,13 +894,33 @@ def _curate_resolver(info: dict) -> dict:
             })
     vids.sort(key=lambda t: -t[0])                 # mayor resolucion primero
     curated = [v for _, v in vids] + auds
+
+    # FOTOS del post (carrusel/album/pin). Van NUMERADAS desde 1 y en el orden
+    # en que el usuario las ve en la app: asi "bajame la 2 y la 5" es
+    # inequivoco entre el humano, Claude y el servidor.
+    imgs = info.get("_cauce_images") or []
+    images = [{
+        "index": im.get("index"),
+        "label": (f"Foto {im.get('index')}"
+                  + (f" · {im.get('width')}x{im.get('height')}"
+                     if im.get("width") and im.get("height") else "")),
+        "width": im.get("width"),
+        "height": im.get("height"),
+        "ext": im.get("ext") or "jpg",
+    } for im in imgs]
+
     return {
         "ok": True,
+        "media_type": info.get("_cauce_media_type") or ("video" if curated else "none"),
         "title": info.get("title"),
         "uploader": info.get("uploader"),
         "thumbnail": info.get("thumbnail"),
         "duration_seconds": duration,
         "formats": curated,
+        "images": images,
+        "image_count": len(images),
+        "full_caption": info.get("description"),
+        "hashtags": info.get("_cauce_hashtags") or [],
         "js_engine": "deno" if DENO_PATH else "none",
         "resolver": True,
         "confidence": info.get("_cauce_confidence"),
@@ -784,14 +935,28 @@ def _curate_resolver(info: dict) -> dict:
 @mcp.tool()
 def list_formats(url: str) -> dict:
     """
-    Muestra los formatos y calidades disponibles de un link de video/audio.
+    Inspecciona un enlace y dice QUE ES y como bajarlo (video, foto o carrusel).
 
-    USA ESTA HERRAMIENTA siempre que el usuario comparta un ENLACE (URL) de
-    YouTube, TikTok, Instagram, Facebook, Twitter/X, etc. y quiera verlo,
-    guardarlo o descargarlo, o pida ver las calidades/formatos o la miniatura.
-    Devuelve titulo, autor, miniatura, duracion y la lista de formatos con su
-    `format_id` (para pasarselo luego a `download`). Para YouTube elige el
-    cliente que da la MAYOR resolucion disponible.
+    USA ESTA HERRAMIENTA SIEMPRE que el usuario comparta un ENLACE (URL) de
+    YouTube, TikTok, Instagram, Facebook, LinkedIn, Pinterest, Twitter/X, etc.
+    y quiera verlo, guardarlo o descargarlo. Es el PRIMER paso: no adivines por
+    la pinta del link si es video o fotos — esta herramienta te lo dice.
+
+    Campos que te importan para decidir:
+      * `media_type`: "video" | "carousel" | "image" | "none".
+          - "video"    -> elige un format_id de `formats` y llama `download`.
+          - "carousel" -> hay VARIAS fotos: mira `images` (numeradas 1..N, en
+                          el mismo orden en que el usuario las ve) y llama
+                          `download_images`. PREGUNTALE al usuario si quiere
+                          todas o solo algunas antes de bajar.
+          - "image"    -> una sola foto: `download_images(url, "all")`.
+      * `full_caption`: el TEXTO COMPLETO del post (no solo el titulo generico
+        tipo "Video by usuario"). Usalo para saber DE QUE trata el contenido.
+      * `hashtags`: los hashtags del post, ya extraidos.
+      * `formats`: calidades de video/audio con su `format_id` para `download`.
+      * `images`: fotos con su `index` (1-based) para `download_images`.
+
+    Para YouTube elige el cliente que da la MAYOR resolucion disponible.
 
     Args:
         url: el link compartido por el usuario.
@@ -837,13 +1002,37 @@ def list_formats(url: str) -> dict:
         if len(seen_res) >= 4:
             break
 
+    # Caption completo tambien por la via de yt-dlp: su `description` ya trae
+    # el texto del post en Facebook/TikTok/YouTube. Es informacion que estaba
+    # ahi y no exponiamos, y le ahorra a Claude tener que adivinar el tema.
+    caption = info.get("description") or None
+    hashtags = _resolver.extract_hashtags(caption) if _resolver else []
+
+    # LIMITE HONESTO: si yt-dlp resolvio el enlace, NO sabemos si el post tenia
+    # ademas un carrusel de fotos — yt-dlp devuelve el primer elemento y calla
+    # el resto. Consultar al resolver aqui costaria un fetch extra en CADA
+    # link, y el caso comun (un video suelto) no lo necesita. En vez de pagar
+    # ese peaje siempre, le decimos a Claude cuando VALE LA PENA preguntar.
+    hint = None
+    if _CAROUSEL_CAPABLE.search(urlparse(url).hostname or ""):
+        hint = ("Este sitio puede tener carruseles de fotos y yt-dlp solo ve el "
+                "primer elemento. Si el usuario menciona fotos, imagenes, "
+                "album o carrusel, llama a resolve_media(url) o directamente a "
+                "download_images(url) — usan el motor estructural y SI las ven.")
+
     return {
         "ok": True,
+        "media_type": "video" if curated else "none",
+        "carousel_hint": hint,
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
         "thumbnail": info.get("thumbnail"),
         "duration_seconds": info.get("duration"),
         "formats": curated,
+        "images": [],
+        "image_count": 0,
+        "full_caption": caption,
+        "hashtags": hashtags,
         "js_engine": "deno" if DENO_PATH else "none",
     }
 
@@ -895,6 +1084,65 @@ def download(url: str, format_id: str) -> dict:
 
 
 @mcp.tool()
+def download_images(url: str, which: str = "all") -> dict:
+    """
+    Descarga las FOTOS de un post: carrusel de Instagram, album de Facebook,
+    pin de Pinterest, documento de LinkedIn, o una imagen suelta.
+
+    USALA cuando `list_formats` haya devuelto `media_type` = "carousel" o
+    "image" (o cuando el usuario pida "bajame las fotos" de un enlace).
+
+    FLUJO RECOMENDADO con el usuario:
+      1. `list_formats(url)` -> te dice cuantas fotos hay y en que orden.
+      2. Si son varias, MUESTRASELAS y preguntale si quiere todas o cuales.
+      3. Llama a esta herramienta con su respuesta.
+    Los numeros son los MISMOS que ve el usuario en la app (1 = la primera).
+
+    Las fotos se guardan numeradas en la galeria del telefono, en el orden del
+    carrusel, y al terminar salta una notificacion.
+
+    Args:
+        url: el link del post.
+        which: "all" para todas (por defecto), o una seleccion: "1,3,5",
+               "2-4", "1-3,7", "primera", "ultima".
+    """
+    if _resolver is None:
+        return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
+
+    job_id = str(uuid.uuid4())[:8]
+    job = {
+        "job_id": job_id,
+        "url": url,
+        "kind": "images",
+        "which": which or "all",
+        "format_id": f"cauce-img:{which or 'all'}",
+        "status": "downloading",
+        "title": None,
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
+    _upsert_job(job)
+
+    t = threading.Thread(target=_download_images_worker, args=(job,), daemon=True)
+    t.start()
+    t.join(timeout=DOWNLOAD_WAIT_SECONDS)
+
+    fresh = _get_job(job_id) or job
+    status = fresh.get("status")
+    if status == "done":
+        return {"ok": True, "job_id": job_id, "status": "done",
+                "downloaded": fresh.get("downloaded"),
+                "requested": fresh.get("requested"),
+                "title": fresh.get("title"),
+                "message": f"Listo: {fresh.get('downloaded')} foto(s) guardadas en tu galeria."}
+    if status == "error":
+        return {"ok": False, "job_id": job_id, "status": "error",
+                "error": fresh.get("error")}
+    return {"ok": True, "job_id": job_id, "status": "downloading",
+            "message": "Bajando las fotos en segundo plano. Te llega una notificacion al terminar."}
+
+
+@mcp.tool()
 def download_status(job_id: str = "") -> dict:
     """
     Consulta el estado de una descarga por job_id, o las ultimas si no se pasa.
@@ -906,9 +1154,9 @@ def download_status(job_id: str = "") -> dict:
         j = _get_job(job_id)
         if not j:
             return {"ok": False, "error": "job no encontrado"}
-        return {"ok": True, "job": {k: v for k, v in j.items() if k != "file_path"}}
+        return {"ok": True, "job": {k: v for k, v in j.items() if k not in ("file_path", "files")}}
     jobs = _load_jobs()
-    return {"ok": True, "jobs": [{k: v for k, v in j.items() if k != "file_path"} for j in jobs[:10]]}
+    return {"ok": True, "jobs": [{k: v for k, v in j.items() if k not in ("file_path", "files")} for j in jobs[:10]]}
 
 
 @mcp.tool()
@@ -933,12 +1181,23 @@ def resolve_media(url: str) -> dict:
         return {"ok": False, "error": f"Fallo el resolver: {e}"}
     return {
         "ok": res.ok,
+        "media_type": getattr(res, "media_type", "none"),
         "title": res.title,
         "uploader": res.uploader,
         "thumbnail": res.thumbnail,
         "duration_seconds": res.duration,
         "confidence": res.confidence,
         "strategy": res.strategy,
+        "full_caption": getattr(res, "full_caption", None),
+        "hashtags": list(getattr(res, "hashtags", []) or []),
+        "images": [{
+            "index": i + 1,
+            "width": c.width,
+            "height": c.height,
+            "score": c.score,
+            "url_preview": c.url[:90],
+            "from": c.provenance,
+        } for i, c in enumerate(getattr(res, "images", []) or [])],
         "formats": [{
             "format_id": (f"cauce-a-0" if f.kind == "audio" else f"cauce-v-{f.height or 0}"),
             "kind": f.kind,
@@ -994,6 +1253,44 @@ def preview_thumbnail(url: str):
 
 
 @mcp.tool()
+def preview_image(url: str, index: int = 1):
+    """
+    Devuelve UNA foto concreta de un carrusel como IMAGEN incrustada, para que
+    Claude pueda VERLA y describirsela al usuario antes de bajar nada.
+
+    Es lo que permite decirle al usuario "la 3 es el grafico de barras, la 5 es
+    la conclusion" en vez de ofrecerle una lista de numeros a ciegas. Llamala
+    con distintos `index` (1..N) si necesitas ver varias.
+
+    Args:
+        url: el link del post.
+        index: numero de la foto, empezando en 1 (el mismo que ve el usuario).
+    """
+    if _resolver is None:
+        return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
+    try:
+        res = _resolver.resolve(url)
+    except Exception as e:
+        return {"ok": False, "error": f"Fallo el resolver: {e}"}
+    imgs = list(getattr(res, "images", []) or [])
+    if not imgs:
+        return {"ok": False, "error": "No encontre fotos en ese enlace.",
+                "reason": res.reason}
+    if not (1 <= index <= len(imgs)):
+        return {"ok": False,
+                "error": f"Ese post tiene {len(imgs)} foto(s); pediste la {index}."}
+    got = _resolver.fetch_image_bytes(imgs[index - 1].url, referer=url)
+    if not got:
+        return {"ok": False, "error": "No pude bajar los bytes de esa foto."}
+    data, ctype = got
+    if Image is None:
+        return {"ok": True, "image_url": imgs[index - 1].url,
+                "note": "Esta version no puede incrustar imagenes; te paso la URL."}
+    fmt = "png" if "png" in (ctype or "").lower() else "jpeg"
+    return Image(data=data, format=fmt)
+
+
+@mcp.tool()
 def health_check() -> dict:
     """Prueba rapida de que yt-dlp sigue funcionando (via la cascada)."""
     try:
@@ -1009,6 +1306,7 @@ def health_check() -> dict:
             "po_token": _pot_provider_reachable(),
             "resolver": _resolver is not None,
             "resolver_ok": bool(_resolver and _resolver.selftest()),
+            "resolver_carousel_ok": bool(_resolver and _resolver.selftest_carousel()),
             "youtube_strategy": _CHAMPION["name"],
             "max_height": _max_height(info),
             "download_dir": str(DOWNLOAD_DIR),
@@ -1022,6 +1320,7 @@ def health_check() -> dict:
                 "po_token": _pot_provider_reachable(),
                 "resolver": _resolver is not None,
                 "resolver_ok": bool(_resolver and _resolver.selftest()),
+                "resolver_carousel_ok": bool(_resolver and _resolver.selftest_carousel()),
                 "youtube_strategy": _CHAMPION["name"], **_friendly_error(e)}
 
 
@@ -1042,6 +1341,7 @@ async def api_health(request):
         "po_token": _pot_provider_reachable(),
         "resolver": _resolver is not None,
         "resolver_ok": bool(_resolver and _resolver.selftest()),
+        "resolver_carousel_ok": bool(_resolver and _resolver.selftest_carousel()),
         "youtube_strategy": _CHAMPION["name"],
     }, headers=CORS_HEADERS)
 
@@ -1050,7 +1350,7 @@ async def api_health(request):
 async def api_jobs(request):
     jobs = _load_jobs()
     # No exponemos file_path (ruta interna del servidor) al cliente.
-    safe = [{k: v for k, v in j.items() if k != "file_path"} for j in jobs]
+    safe = [{k: v for k, v in j.items() if k not in ("file_path", "files")} for j in jobs]
     return JSONResponse({"jobs": safe}, headers=CORS_HEADERS)
 
 

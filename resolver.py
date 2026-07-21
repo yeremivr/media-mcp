@@ -879,21 +879,40 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
     anc_l = " ".join(rc.ancestors).lower()
     host = parsed.hostname.lower()
 
+    # MUSICA DE FONDO != VIDEO DEL POST. Facebook le pega una pista de audio a
+    # un album ("Avicii - Levels" sobre 12 fotos) y la publica en
+    # `story_media_metadata.audio_url`, servida desde video.fbcdn.net con path
+    # de video (.mp4). Mirando SOLO la URL, dispara todas las senales de VIDEO
+    # (vext, vmime) y NINGUNA de audio -> se colaba como el "video" del post
+    # con score 94, le ganaba a las fotos (76) y marcaba el album entero como
+    # media_type=video; su cauce-v-0 se "descargaba" pero nunca habia nada
+    # reproducible (era la cancion). Lo que la delata NO es la URL sino el
+    # NOMBRE: la clave `audio_url` o el ancestro `story_media_metadata`. Un
+    # video real trae su propio stream por `browser_native_*`/`playable_url`,
+    # nunca por `audio_url`, asi que esta senal no toca a los videos de verdad.
+    is_bg_audio = ("audio" in key_l) or ("story_media_metadata" in anc_l)
+
     s = 0.0
     feats = []
 
     if MEDIA_CDN_HOSTS.search(host):
         s += W["host_media_cdn"]; feats.append("cdn")
 
-    is_video = bool(VIDEO_EXT.search(url)) or "mime_type=video" in url.lower() or "video/mp4" in url.lower()
-    is_audio = bool(AUDIO_EXT.search(url)) or "mime_type=audio" in url.lower()
+    _url_video = (bool(VIDEO_EXT.search(url)) or "mime_type=video" in url.lower()
+                  or "video/mp4" in url.lower())
+    # La musica de fondo NO es video por mas que su URL lo parezca.
+    is_video = _url_video and not is_bg_audio
+    is_audio = (bool(AUDIO_EXT.search(url)) or "mime_type=audio" in url.lower()
+                or is_bg_audio)
     is_image = bool(IMAGE_EXT.search(url))
 
+    if is_bg_audio:
+        feats.append("bgaudio")
     if is_video:
         s += W["ext_video"]; feats.append("vext")
     if is_audio and not is_video:
         s += W["ext_audio"]; feats.append("aext")
-    if "mime_type=video" in url.lower() or "video/mp4" in url.lower():
+    if _url_video and not is_bg_audio:
         s += W["video_mime_param"]; feats.append("vmime")
     if is_image:
         s += W["ext_image"]; feats.append("img")
@@ -945,7 +964,11 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
                               path=rc.path,
                               provenance=f"{'/'.join(rc.ancestors[-3:])}::{rc.key} "
                                          f"[{','.join(feats)}]")
-    if is_video or (mime and mime.startswith("video")):
+    if is_bg_audio:
+        # Pista de musica del album: audio SIEMPRE, aunque una hermana diga
+        # mime video. No debe poder volverse "video" por ninguna via.
+        kind = "audio"
+    elif is_video or (mime and mime.startswith("video")):
         kind = "video"
     elif is_audio or (mime and mime.startswith("audio")):
         kind = "audio"
@@ -1795,9 +1818,14 @@ class ResolveResult:
     diagnostics: dict = field(default_factory=dict)
     # --- lo que agrega el pase de imagen / caption ---
     images: list = field(default_factory=list)    # MediaCandidate en ORDEN
-    media_type: str = "none"                      # video|carousel|image|none
+    media_type: str = "none"                      # video|carousel|image|audio|none
     full_caption: str | None = None               # el texto COMPLETO del post
     hashtags: list = field(default_factory=list)
+    # CUANTAS fotos tiene el album DE VERDAD (Facebook: el `count` de
+    # `all_subattachments`). A un crawler anonimo Facebook solo le incrusta las
+    # ~4 del preview, pero declara el total. Guardarlo permite avisar "N de M"
+    # con la M correcta en vez de mentir "N de N". None si no se pudo saber.
+    images_available: int | None = None
 
     def to_info(self) -> dict:
         """Convierte a un 'info dict' estilo yt-dlp para que el server lo cure
@@ -1834,6 +1862,7 @@ class ResolveResult:
             "_cauce_strategy": self.strategy,
             "_cauce_confidence": self.confidence,
             "_cauce_media_type": self.media_type,
+            "_cauce_images_available": self.images_available,
             "_cauce_hashtags": list(self.hashtags),
             "_cauce_images": [{
                 "index": i + 1,                  # 1-based: lo que ve el humano
@@ -2139,6 +2168,50 @@ def _parse_duration(d) -> int | None:
     return None
 
 
+# Claves donde Facebook declara CUANTAS subattachments tiene el album de
+# verdad. `count` es la de `all_subattachments`; las otras aparecen en variantes
+# del mismo grafo. Estan acotadas a un rango sano para no tragarse un contador
+# cualquiera (likes, comentarios) que ande cerca.
+_ALBUM_COUNT_KEYS = ("count", "media_count", "subattachment_count",
+                     "subattachments_count", "total_count")
+
+
+def _detect_album_total(json_trees: list) -> int | None:
+    """Devuelve el CONTEO REAL de fotos de un album de Facebook, o None.
+
+    Facebook incrusta las subattachments en un contenedor cuyo NOMBRE habla de
+    subattachments (`all_subattachments`, `subattachments`), y ese contenedor
+    trae un `count` con el total AUNQUE a un crawler anonimo solo le meta las
+    ~4 fotos del preview. Leer ese numero es lo que permite avisar la verdad
+    ("descargue 4 de 12") en vez de "4 de 4".
+
+    Deliberadamente CONSERVADOR: solo cuenta contenedores cuyo nombre menciona
+    "subattachment". Instagram usa `edge_sidecar_to_children` (otra palabra) y
+    ya entrega la lista completa, asi que esta deteccion NO lo toca."""
+    best: int | None = None
+
+    def _rec(node, keyname: str):
+        nonlocal best
+        if isinstance(node, dict):
+            if "subattachment" in keyname.lower():
+                for ck in _ALBUM_COUNT_KEYS:
+                    n = _int_or_none(node.get(ck))
+                    if n is not None and 1 <= n <= 500:
+                        best = n if best is None else max(best, n)
+            for k, v in node.items():
+                _rec(v, str(k))
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                _rec(v, keyname)
+
+    for t in json_trees:
+        try:
+            _rec(t, "")
+        except Exception:
+            continue
+    return best
+
+
 def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResult:
     """NUCLEO PURO (sin red): dado el HTML, devuelve el resultado. Esto es lo
     que testeamos con fixtures — es determinista y no toca la red."""
@@ -2187,11 +2260,17 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     # Es el ejemplo etiquetado que la propia pagina nos regala.
     anchor = (metas.get("og:image") or metas.get("og:image:secure_url")
               or metas.get("twitter:image"))
+    # `drop_video_posters` quita las caratulas de los VIDEOS: se le pasan solo
+    # los videos reales, NO el audio. Una pista de musica de fondo no tiene
+    # caratula, y colarla aqui hacia que la red de seguridad por-ancla tomara
+    # la 1a foto del album (que suele ser el og:image) por "portada del video"
+    # y la borrara -> el album de 4 salia con 3.
+    real_videos = [c for c in media if c.kind == "video"]
     images = group_images(
         drop_video_posters(
             keep_authoritative([c for c in img_scored
                                 if c.score >= MIN_IMAGE_SCORE], anchor=anchor),
-            media, anchor=anchor))
+            real_videos, anchor=anchor))
 
     meta = _find_meta((dom_media, json_trees, metas), page_url)
     # Si no hubo miniatura en el meta, usa la imagen mejor puntuada como thumb.
@@ -2227,8 +2306,12 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
                 or (win.mime or "").startswith(("video", "audio"))):
             conf = min(conf, WEAK_CONFIDENCE)
 
-    # Sin video pero CON fotos, la confianza la marca el pase de imagen.
-    if not media and images:
+    # Sin VIDEO REAL pero CON fotos, la confianza la marca el pase de imagen.
+    # (Se mira `has_real_video`, no `media`: un album con musica de fondo tiene
+    # `media`=[esa pista de audio], pero su confianza debe salir de las fotos,
+    # que son el medio principal, no de la cancion.)
+    has_real_video = any(c.kind == "video" for c in media)
+    if not has_real_video and images:
         top_i = max(c.score for c in images)
         conf = round(min(1.0, top_i / 100.0) * 0.85, 3)
         # Mismo criterio: si de NINGUNA foto conocemos su tamano, no sabemos
@@ -2237,16 +2320,32 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
             conf = min(conf, WEAK_CONFIDENCE)
 
     # QUE ES ESTO: la respuesta que Claude necesita para no adivinar mirando
-    # el link. `video` manda si hay algo reproducible (el usuario que comparte
-    # un reel quiere el reel); si no hay video, 2+ fotos = carrusel.
-    if media:
+    # el link. `video` manda si hay un VIDEO DE VERDAD (el usuario que comparte
+    # un reel quiere el reel). OJO: `media` puede contener SOLO una pista de
+    # audio (la musica de fondo que Facebook le pega a un album). Esa pista no
+    # es el medio principal del post -> no debe marcar el post como "video". Si
+    # no hay video real, 2+ fotos = carrusel; una sola = imagen; y si lo unico
+    # que hay es esa musica sin fotos, es un post de audio.
+    # (`has_real_video` ya se calculo arriba, en el bloque de confianza.)
+    if has_real_video:
         media_type = "video"
     elif len(images) >= 2:
         media_type = "carousel"
     elif images:
         media_type = "image"
+    elif media:                      # solo audio (p.ej. musica de fondo)
+        media_type = "audio"
     else:
         media_type = "none"
+
+    # CONTEO REAL del album (Facebook declara el total aunque solo incruste el
+    # preview). Si el total supera lo que pudimos ver, es la senal de que
+    # faltan fotos tras la sesion; lo guardamos para avisar "N de M". Nunca por
+    # debajo de lo detectado: si vemos mas de lo declarado, mandan las vistas.
+    album_total = _detect_album_total(json_trees)
+    images_available = (max(album_total, len(images))
+                        if album_total is not None else
+                        (len(images) or None))
 
     ok = bool(media or images)
     reason = "" if ok else (
@@ -2260,10 +2359,12 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         formats=media, reason=reason,
         images=images, media_type=media_type,
         full_caption=caption, hashtags=hashtags,
+        images_available=images_available,
         diagnostics={
             "dom_media": len(dom_media), "json_trees": len(json_trees),
             "raw_candidates": len(raws), "scored_media": len(scored),
             "scored_images": len(img_scored), "images_kept": len(images),
+            "images_available": images_available,
             "media_type": media_type,
             "top_scores": [(c.url[:80], c.score, c.height) for c in media[:5]],
             "top_images": [(c.url[:80], c.score, c.width, c.height) for c in images[:5]],
@@ -2275,14 +2376,120 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
 # 7. RED (baja el HTML; solo esto toca internet — testeado aparte)
 # ==========================================================================
 
+# --------------------------------------------------------------------------
+# SESION DE FACEBOOK (cookies). OPCIONAL y con degradacion limpia.
+#
+# El motor baja el HTML el mismo (no el navegador del telefono), asi que estar
+# logueado en la app NO le pasa la sesion. A un crawler ANONIMO Facebook solo
+# le incrusta las ~4 fotos del preview de un album; el resto vive tras la
+# sesion. Con un cookies.txt de Facebook (formato Netscape, el mismo que ya se
+# usa para YouTube) mandamos el header `Cookie` y, con un UA de navegador real,
+# Facebook server-renderiza el album COMPLETO en la MISMA estructura
+# (`all_subattachments`) que el walker ya entiende -> el motor ve las 12 sin
+# codigo nuevo de paginacion.
+#
+# POR QUE cookies+navegador y NO seguir el cursor GraphQL: emitir el request
+# paginado exige `doc_id`/`fb_dtsg`/`variables` que Facebook rota sin aviso —
+# justo la fragilidad de extractor-a-mano que este motor existe para evitar.
+# La sesion + SSR reutiliza el grafo y el scoring que ya tenemos y degrada
+# solo: sin cookies, se cae al Nivel 1 (las 4 que se ven + aviso "N de M").
+#
+# Fuentes, en orden: env FB_COOKIES_FILE, luego el cookies.txt generico
+# (env YT_COOKIES_FILE / COOKIES_FILE), /etc/secrets, y junto al modulo.
+# --------------------------------------------------------------------------
+_FB_COOKIE_DOMAINS = ("facebook.com", "fbcdn.net", "fbsbx.com", "fb.watch",
+                      "fb.com")
+_FB_COOKIE_CACHE: dict = {"loaded": False, "jar": {}}
+
+
+def _fb_cookies_path() -> str | None:
+    """Primer cookies.txt de Facebook que exista. Best-effort, nunca lanza."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (os.environ.get("FB_COOKIES_FILE"),
+              os.environ.get("COOKIES_FILE"),
+              os.environ.get("YT_COOKIES_FILE"),
+              "/etc/secrets/fb_cookies.txt",
+              "/etc/secrets/cookies.txt",
+              os.path.join(here, "fb_cookies.txt"),
+              os.path.join(here, "cookies.txt")):
+        try:
+            if c and os.path.exists(c):
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def _parse_netscape_cookies(path: str) -> dict:
+    """Lee un cookies.txt (formato Netscape) y devuelve {nombre: valor} de las
+    cookies de dominios de Facebook. Tolera comentarios, el prefijo `#HttpOnly_`
+    y lineas rotas. Nunca lanza: una cookie mal formada no tumba el fetch."""
+    jar: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                raw = line.strip()
+                if not raw or raw.startswith("#") and not raw.startswith("#HttpOnly_"):
+                    continue
+                raw = raw.replace("#HttpOnly_", "")
+                parts = raw.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain = parts[0].lstrip(".").lower()
+                if not any(domain == d or domain.endswith("." + d)
+                           for d in _FB_COOKIE_DOMAINS):
+                    continue
+                name, value = parts[5].strip(), parts[6].strip()
+                if name:
+                    jar[name] = value
+    except Exception:
+        return jar
+    return jar
+
+
+def _fb_cookie_jar() -> dict:
+    """Cookies de Facebook parseadas (cacheadas). {} si no hay archivo."""
+    if not _FB_COOKIE_CACHE["loaded"]:
+        path = _fb_cookies_path()
+        _FB_COOKIE_CACHE["jar"] = _parse_netscape_cookies(path) if path else {}
+        _FB_COOKIE_CACHE["loaded"] = True
+    return _FB_COOKIE_CACHE["jar"]
+
+
+def reset_fb_cookie_cache() -> None:
+    """Fuerza a releer el cookies.txt (tests / recarga en caliente)."""
+    _FB_COOKIE_CACHE["loaded"] = False
+    _FB_COOKIE_CACHE["jar"] = {}
+
+
+def _cookie_header_for(url: str) -> str | None:
+    """Header `Cookie` para una URL de Facebook si hay sesion configurada; None
+    en cualquier otro caso (otro sitio, sin cookies, o cualquier fallo)."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if not any(host == d or host.endswith("." + d)
+                   for d in _FB_COOKIE_DOMAINS):
+            return None
+        jar = _fb_cookie_jar()
+        if not jar:
+            return None
+        return "; ".join(f"{k}={v}" for k, v in jar.items()) or None
+    except Exception:
+        return None
+
+
 def _http_get(url: str, ua: str, *, max_bytes: int, referer: str | None = None) -> tuple[bytes, str]:
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": ua,
         "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         **({"Referer": referer} if referer else {}),
-    })
+    }
+    ck = _cookie_header_for(url)          # sesion de Facebook, si la hay
+    if ck:
+        headers["Cookie"] = ck
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
         raw = r.read(max_bytes + 1)
         enc = (r.headers.get("Content-Encoding") or "").lower()
@@ -2397,6 +2604,11 @@ def resolve(url: str, *, profile: Profile | None = None,
                 # etiqueta; si encontro video, "video" manda y no se toca.
                 if res.media_type in ("none", "image"):
                     res.media_type = best.media_type
+            # El total del album (Facebook lo declara) puede venir de la puerta
+            # que MENOS fotos vio; nos quedamos siempre con el mayor conocido.
+            res.images_available = max(
+                [n for n in (res.images_available, best.images_available)
+                 if n is not None] or [len(res.images) or 0]) or None
 
         if best is None or res.confidence > best.confidence or (res.ok and not best.ok):
             best = res
@@ -2524,11 +2736,15 @@ _MEDIA_GATE_MEMORY: dict = {}
 
 def _http_get_image(url: str, ua: str, *, max_bytes: int,
                     referer: str | None) -> bytes:
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": ua,
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         **({"Referer": referer} if referer else {}),
-    })
+    }
+    ck = _cookie_header_for(url)          # sesion de Facebook para el CDN
+    if ck:
+        headers["Cookie"] = ck
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
         return r.read(max_bytes)
 

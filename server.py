@@ -908,6 +908,12 @@ def _download_images_worker(job: dict):
             raise RuntimeError("Encontre las fotos pero el CDN no me dejo "
                                "bajar ninguna (pueden haber expirado).")
 
+        # CONTEO HONESTO. `imgs` son las fotos que el motor PUDO ver; en un
+        # album de Facebook, sin sesion, suelen ser solo las ~4 del preview.
+        # `images_available` es el total REAL que Facebook declara. Antes se
+        # avisaba "4 de 4" (mentira: eran 4 de 12). Ahora se dice la verdad y,
+        # si faltan, se explica por que.
+        total = max(getattr(res, "images_available", None) or 0, len(imgs))
         job.update({
             "status": "done",
             "title": res.title or f"{len(files)} foto(s)",
@@ -917,15 +923,20 @@ def _download_images_worker(job: dict):
             "files": files,
             "downloaded": len(files),
             "requested": len(picked),
+            "available": total,
             "failed": errors,
             "updated_at": _now(),
         })
         _upsert_job(job)
 
-        bits = [f"{len(files)} de {len(imgs)} fotos"]
+        bits = [f"{len(files)} de {total} fotos"]
         if res.uploader:
             bits.insert(0, res.uploader)
-        bits.append("Guardadas en tu galería")
+        faltan = total - len(imgs)
+        if faltan > 0:
+            bits.append(f"faltan {faltan} (requieren iniciar sesión en Facebook)")
+        else:
+            bits.append("Guardadas en tu galería")
         _notify(job_id, res.title or "Fotos descargadas", "  ·  ".join(bits),
                 filepath=files[0], image_path=files[0], icon="photo_library")
     except Exception as e:
@@ -1052,6 +1063,10 @@ def _curate_resolver(info: dict) -> dict:
         "formats": curated,
         "images": images,
         "image_count": len(images),
+        # CUANTAS fotos tiene el album de verdad (Facebook lo declara aunque
+        # solo incruste el preview). Si supera a las vistas, faltan tras la
+        # sesion. `image_count` es lo que SE PUEDE bajar ahora; este es el total.
+        "images_available": info.get("_cauce_images_available") or len(images),
         "full_caption": info.get("description"),
         "hashtags": info.get("_cauce_hashtags") or [],
         "js_engine": "deno" if DENO_PATH else "none",

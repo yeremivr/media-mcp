@@ -2254,6 +2254,44 @@ def _facebook_album_url(album_set: str) -> str:
     return f"https://www.facebook.com/media/set/?set={album_set}"
 
 
+# El endpoint de CRAWLER de Facebook: dado el id de una foto, devuelve la imagen
+# real (JPEG) SIN sesion. Verificado en vivo (1138 KB). Es la superficie que FB
+# le sirve a los desplegadores de link, y la clave para bajar el album completo:
+# la pagina /media/set/ trae las fotos como URLs de proxy (scontent/m1/v/t6/...)
+# que NO se descargan, pero SI trae el media_id de cada una -> lo convertimos.
+def _fb_lookaside_url(media_id: str) -> str:
+    return ("https://lookaside.fbsbx.com/lookaside/crawler/media/"
+            f"?media_id={media_id}")
+
+
+# media_id de foto: en los permalinks (?fbid= / media_id=) y en los nodos Photo
+# del GraphQL. `story_fbid=` se EXCLUYE a proposito (lleva `_fbid`, no es foto).
+_FB_MEDIA_ID_RE = re.compile(r'(?:media_id=|[?&]fbid=|"fbid":")(\d{8,17})')
+_FB_PHOTO_NODE_RE = re.compile(r'"__(?:isMedia|typename)":"Photo"')
+_FB_ID_RE = re.compile(r'"id":"(\d{8,17})"')
+
+
+def _collect_fb_media_ids(html: str) -> list[str]:
+    """media_ids de las fotos del album, en ORDEN de documento y sin repetir.
+    Combina los ids de los permalinks/lookaside con los de los nodos `Photo`
+    del GraphQL (que traen su `id` aunque la `uri` sea una URL de proxy)."""
+    pos: dict[str, int] = {}
+
+    def _add(mid: str, at: int):
+        if mid not in pos:
+            pos[mid] = at
+
+    for m in _FB_MEDIA_ID_RE.finditer(html or ""):
+        _add(m.group(1), m.start())
+    # Nodos Photo: el `id` esta a pocos caracteres del marcador de tipo.
+    for m in _FB_PHOTO_NODE_RE.finditer(html or ""):
+        base = max(0, m.start() - 220)
+        seg = html[base:m.start() + 220]
+        for mm in _FB_ID_RE.finditer(seg):
+            _add(mm.group(1), base + mm.start())
+    return [mid for mid, _ in sorted(pos.items(), key=lambda kv: kv[1])]
+
+
 def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResult:
     """NUCLEO PURO (sin red): dado el HTML, devuelve el resultado. Esto es lo
     que testeamos con fixtures — es determinista y no toca la red."""
@@ -2697,20 +2735,40 @@ def _expand_fb_album(res: "ResolveResult | None", host: str, fetch):
     if not faltan:
         return res
     album_url = _facebook_album_url(res.album_set)
+    strat = (res.strategy or "facebook") + "+albumset"
     try:
         raw, _f = fetch(album_url, _GOOGLEBOT_UA,
                         max_bytes=_MAX_HTML_BYTES, referer=res.url)
-        alb = resolve_html(raw.decode("utf-8", errors="replace"), album_url,
-                           strategy=(res.strategy or "facebook") + "+albumset")
+        html_alb = raw.decode("utf-8", errors="replace")
+        alb = resolve_html(html_alb, album_url, strategy=strat)
     except Exception:
         return res                              # sin red / bloqueado: como antes
-    # Solo adoptamos si el album trajo MAS fotos que las que ya teniamos.
-    if len(alb.images) > len(res.images):
-        res.images = alb.images
+
+    # LAS FOTOS, POR LOOKASIDE. La pagina /media/set/ sirve las fotos como URLs
+    # de proxy (scontent/m1/v/t6/...) que NO se descargan (verificado: 10 de 11
+    # fallaban). Pero trae el media_id de cada foto, y el endpoint de crawler
+    # lookaside SI da la imagen real. Reconstruimos el album desde los media_id
+    # como URLs lookaside descargables, en orden de documento.
+    ids = _collect_fb_media_ids(html_alb)
+    lookaside_imgs = [
+        MediaCandidate(_fb_lookaside_url(mid), 80.0, "image", order=i,
+                       is_post_media=True,
+                       provenance=f"album_set/media/#{i}::lookaside media_id={mid}")
+        for i, mid in enumerate(ids)]
+
+    # Nos quedamos con la fuente que MAS fotos DESCARGABLES ofrece: lookaside si
+    # trajo al menos tantas como el pase de imagen (y mas que las que ya
+    # teniamos); si no, las que saco el pase normal del album.
+    best_set = alb.images
+    if len(lookaside_imgs) >= max(2, len(alb.images)):
+        best_set = lookaside_imgs
+
+    if len(best_set) > len(res.images):
+        res.images = best_set
         res.images_available = max(res.images_available or 0,
-                                   alb.images_available or 0, len(alb.images))
-        res.strategy = alb.strategy
-        if len(alb.images) >= 2 and res.media_type in ("none", "image", "audio"):
+                                   alb.images_available or 0, len(best_set))
+        res.strategy = strat
+        if len(best_set) >= 2 and res.media_type in ("none", "image", "audio"):
             res.media_type = "carousel"
         if not res.thumbnail:
             res.thumbnail = alb.thumbnail

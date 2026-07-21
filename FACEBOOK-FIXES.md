@@ -86,8 +86,18 @@ Implementación (`resolver.py`):
    **adopta el juego completo de fotos**. Un post normal no paga ni un fetch de
    más. Degrada limpio: si falla, se queda con lo que tenía.
 
-Resultado: el álbum de Tomorrowland (11 fotos tras muro) ahora se resuelve
-**completo, sin cookies, sin configurar nada**.
+3. **Descarga por `lookaside` (la pieza final).** La página `/media/set/` sirve
+   las fotos como URLs de **proxy** (`scontent/m1/v/t6/…`) que **no se
+   descargan** (medido: 10 de 11 fallaban). Pero trae el **`media_id`** de cada
+   foto, y el **endpoint de crawler** `lookaside.fbsbx.com/lookaside/crawler/
+   media/?media_id=<id>` **sí** devuelve la imagen real (JPEG, sin sesión).
+   `_collect_fb_media_ids()` extrae los ids de los nodos `Photo` del álbum y
+   `_expand_fb_album()` reconstruye el juego completo como URLs `lookaside`
+   descargables, en orden.
+
+Resultado: el álbum de Tomorrowland (11 fotos tras muro, servidas como proxy
+inservible) ahora se resuelve y **descarga completo, sin cookies, sin
+configurar nada**.
 
 > `fb_recon.py` queda en el repo como instrumento: corre en el teléfono, mide
 > qué puerta pública trae más fotos, y da un veredicto. Útil si Facebook cambia

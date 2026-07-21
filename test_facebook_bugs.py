@@ -288,6 +288,45 @@ def main():
     ok &= check("Instagram (u otro sin album_set) nunca dispara la expansion FB",
                 not any("/media/set/" in c for c in calls2))
 
+    print("\n=== BUG B Nivel 2-ter: fotos DESCARGABLES por lookaside (caso real) ===")
+    # Verdad de campo (FASE 4 forense en el telefono): la pagina /media/set/
+    # sirve las fotos como URLs de proxy (scontent/m1/v/t6/...) que NO se
+    # descargan (10 de 11 fallaban); solo el endpoint de crawler lookaside da la
+    # imagen real. Pero /media/set/ trae el media_id de cada foto -> se
+    # reconstruye el album como URLs lookaside descargables.
+    ALB2 = "280926630269672"
+    WALL2 = (f'<html><body>You must log in. set=a.{ALB2} "count":11 '
+             '<a href="/login/?">login</a></body></html>')
+
+    def _media_set_proxy(n):
+        nodes = []
+        for i in range(1, n + 1):
+            mid = f"38661333970{1000 + i}"
+            nodes.append(
+                '{"__typename":"Photo","__isMedia":"Photo","id":"%s","image":'
+                '{"uri":"https:\\/\\/scontent.flim3-2.fna.fbcdn.net\\/m1\\/v'
+                '\\/t6\\/An_PROXY%d","width":960,"height":720}}' % (mid, i))
+        return ('<html><head><meta property="og:image" content='
+                '"https://scontent.fbcdn.net/v/t39.0/cover.jpg?oh=A&oe=1">'
+                '</head><body><script>{"story":{"attachments":[{"styles":'
+                '{"attachment":{"all_subattachments":{"count":11,"nodes":[%s]'
+                '}}}}]}}</script></body></html>' % ",".join(nodes))
+
+    def fetch_proxy_album(url, ua, *, max_bytes, referer=None):
+        if "/media/set/" in url and "Googlebot" in ua:
+            return _media_set_proxy(11).encode("utf-8"), url
+        return WALL2.encode("utf-8"), url
+
+    rL = R.resolve("https://www.facebook.com/share/p/195wKPqx9m/",
+                   fetch=fetch_proxy_album, max_attempts=2)
+    lookaside = [im for im in rL.images if "lookaside.fbsbx.com" in im.url]
+    ok &= check("las 11 fotos del album se detectan", len(rL.images) == 11)
+    ok &= check("TODAS salen como URLs lookaside (descargables), no proxy",
+                len(lookaside) == 11
+                and all("m1/v/t6" not in im.url for im in rL.images))
+    ok &= check("cada lookaside lleva el media_id de su foto",
+                all("media_id=" in im.url for im in lookaside))
+
     print("\n" + ("=" * 62))
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

@@ -65,7 +65,35 @@ mandaba cookies ni paginaba, así que nunca veía más de 4.
 - El server ahora avisa **"N de M" con la M correcta**: en vez de "4 de 4"
   (mentira), dice *"4 de 12 · faltan 8 (requieren iniciar sesión en Facebook)"*.
 
-### Nivel 2 — arreglo completo (con sesión de Facebook)
+### Nivel 2 — arreglo completo SIN cookies (ataque directo al álbum) ⭐
+
+**Este es el camino que resolvió el caso, sin iniciar sesión.** Descubierto por
+ingeniería inversa con reconocimiento en vivo desde el teléfono (`fb_recon.py`):
+
+- El link que compartes (`/share/p/...`) y el post dan **muro de login** en
+  todas las puertas... **pero filtran en el JSON el ID del álbum** (`set=a.NNN`)
+  y el conteo real, aunque no muestren las fotos.
+- La **URL directa del álbum** — `https://www.facebook.com/media/set/?set=a.NNN`
+  — es superficie pública indexable, y **Facebook SÍ se la sirve a Googlebot**.
+  Medido en vivo: devuelve el álbum **completo (11/11 fotos)** sin cookies.
+
+Implementación (`resolver.py`):
+1. `_detect_album_set()` cosecha `set=a.NNN`/`set=pcb.NNN` del HTML crudo (se
+   filtra incluso en páginas-muro). Se guarda en `ResolveResult.album_set`.
+2. `_expand_fb_album()` en `resolve()`: **solo si sabemos que faltan fotos**
+   (`images_available > vistas`, o muro con < 2 fotos) y hay `album_set`, pide
+   `/media/set/?set=a.NNN` a Googlebot, corre el mismo motor sobre esa página y
+   **adopta el juego completo de fotos**. Un post normal no paga ni un fetch de
+   más. Degrada limpio: si falla, se queda con lo que tenía.
+
+Resultado: el álbum de Tomorrowland (11 fotos tras muro) ahora se resuelve
+**completo, sin cookies, sin configurar nada**.
+
+> `fb_recon.py` queda en el repo como instrumento: corre en el teléfono, mide
+> qué puerta pública trae más fotos, y da un veredicto. Útil si Facebook cambia
+> y hay que volver a hacer recon.
+
+### Nivel 3 — respaldo con sesión de Facebook (cookies, opcional)
 
 `resolver.py` ahora puede mandar el header `Cookie` en `_http_get` y
 `_http_get_image`, tomando la sesión de un `cookies.txt` de Facebook.

@@ -200,6 +200,71 @@ def main():
         os.environ.pop("FB_COOKIES_FILE", None)
         R.reset_fb_cookie_cache()
 
+    print("\n=== BUG B Nivel 2-bis: ATAQUE DIRECTO AL ALBUM (/media/set) sin cookies ===")
+    # Verdad de campo (recon en vivo desde el telefono): el link /share/ da MURO
+    # en todas las puertas, pero FILTRA el id del album (set=a.NNN) y el total.
+    # La URL directa /media/set/?set=a.NNN, servida a Googlebot, devuelve el
+    # album COMPLETO (11/11) sin sesion. Aqui se replica ese flujo con fetch
+    # inyectado y se verifica que resolve() adopta las 11.
+    ALBUM = "280926630269672"
+    # Pagina-MURO del /share/: 0 fotos, pero deja escapar el set y el count.
+    WALL = ('<html><body>You must log in to continue. '
+            f'"count":11 set=a.{ALBUM} '
+            + " ".join(f"fbid=90000{i}" for i in range(1, 7))
+            + '<a href="/login/?">login</a></body></html>')
+
+    def _media_set_page(n):
+        # /media/set servida a Googlebot: las N fotos como subattachments.
+        nodes = ",".join(
+            '{"media":{"image":{"uri":'
+            f'"https:\\/\\/scontent.fbcdn.net\\/v\\/t39.0\\/set{i}.jpg?oh=S{i}&oe=1",'
+            '"width":960,"height":720}}}' for i in range(1, n + 1))
+        return ('<html><head><meta property="og:image" content='
+                f'"https://scontent.fbcdn.net/v/t39.0/set1.jpg?oh=S1&oe=1">'
+                '</head><body><script>{"story":{"attachments":[{"styles":'
+                '{"attachment":{"all_subattachments":{"count":11,"nodes":['
+                f'{nodes}]}}}}}}]}}}}</script></body></html>')
+
+    calls = []
+
+    def fetch_album(url, ua, *, max_bytes, referer=None):
+        calls.append(url)
+        if "/media/set/" in url and "Googlebot" in ua:
+            return _media_set_page(11).encode("utf-8"), url   # album completo
+        if "/media/set/" in url:
+            return b"<html><body>login_required</body></html>", url  # navegador: 400-like
+        return WALL.encode("utf-8"), url                      # el /share/ da muro
+
+    rA = R.resolve("https://www.facebook.com/share/p/195wKPqx9m/",
+                   fetch=fetch_album, max_attempts=2)
+    ok &= check("del muro se cosecha el set del album (a.NNN)",
+                rA.album_set == f"a.{ALBUM}")
+    ok &= check("resolve() ataca /media/set/ y adopta las 11 fotos",
+                len(rA.images) == 11 and rA.media_type == "carousel")
+    ok &= check("efectivamente pidio la URL directa del album a Googlebot",
+                any("/media/set/?set=a." + ALBUM in c for c in calls))
+    ok &= check("images_available refleja el album completo",
+                rA.images_available == 11)
+
+    # NO expandir cuando NO hace falta: un post ya completo no gasta fetch extra.
+    calls2 = []
+
+    def fetch_complete(url, ua, *, max_bytes, referer=None):
+        calls2.append(url)
+        return _media_set_page(3).encode("utf-8"), url        # 3 fotos, count 11...
+
+    # ...pero si ya vemos == lo declarado no hay gap. Forzamos un caso completo:
+    def fetch_full_post(url, ua, *, max_bytes, referer=None):
+        calls2.append(url)
+        # post con 2 fotos y sin album_set ni total mayor -> no expande.
+        return _fb_album_html(2, 2, with_music=False).encode("utf-8"), url
+
+    calls2.clear()
+    rC = R.resolve("https://www.instagram.com/p/ABC/",
+                   fetch=fetch_full_post, max_attempts=1)
+    ok &= check("Instagram (u otro sin album_set) nunca dispara la expansion FB",
+                not any("/media/set/" in c for c in calls2))
+
     print("\n" + ("=" * 62))
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

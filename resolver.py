@@ -1826,6 +1826,11 @@ class ResolveResult:
     # ~4 del preview, pero declara el total. Guardarlo permite avisar "N de M"
     # con la M correcta en vez de mentir "N de N". None si no se pudo saber.
     images_available: int | None = None
+    # SET/ALBUM de Facebook (p.ej. "a.280926630269672"), cosechado del JSON aun
+    # cuando la pagina da MURO. Con el, `resolve()` puede pedir la URL DIRECTA
+    # del album (/media/set/?set=a.ID) —que Facebook si le sirve a Googlebot— y
+    # traer el album COMPLETO sin cookies. Verificado en vivo (11/11 fotos).
+    album_set: str | None = None
 
     def to_info(self) -> dict:
         """Convierte a un 'info dict' estilo yt-dlp para que el server lo cure
@@ -1863,6 +1868,7 @@ class ResolveResult:
             "_cauce_confidence": self.confidence,
             "_cauce_media_type": self.media_type,
             "_cauce_images_available": self.images_available,
+            "_cauce_album_set": self.album_set,
             "_cauce_hashtags": list(self.hashtags),
             "_cauce_images": [{
                 "index": i + 1,                  # 1-based: lo que ve el humano
@@ -2212,6 +2218,31 @@ def _detect_album_total(json_trees: list) -> int | None:
     return best
 
 
+# El SET/ALBUM de Facebook aparece en el HTML como `set=a.<digitos>` (album
+# formal) o `set=pcb.<digitos>` (bundle de un post multi-foto), tanto en los
+# permalinks de foto como en el JSON —y SE FILTRA aunque la pagina de MURO—.
+# Con ese id se ataca la URL directa del album, que FB si le abre a Googlebot.
+_ALBUM_SET_RE = re.compile(r"set=(a\.\d{6,}|pcb\.\d{6,})")
+
+
+def _detect_album_set(html: str) -> str | None:
+    """El set/album de Facebook mas frecuente en el HTML, o None. Prefiere el
+    album formal `a.` sobre el bundle `pcb.` (el `a.` es la galeria completa)."""
+    hits = _ALBUM_SET_RE.findall(html or "")
+    if not hits:
+        return None
+    a_sets = [h for h in hits if h.startswith("a.")]
+    pool = a_sets or hits
+    # el mas repetido (todas las fotos del album citan el mismo set)
+    return max(set(pool), key=pool.count)
+
+
+def _facebook_album_url(album_set: str) -> str:
+    """URL DIRECTA y publica del album (superficie indexable que FB abre a los
+    buscadores). `album_set` es "a.<id>" o "pcb.<id>"."""
+    return f"https://www.facebook.com/media/set/?set={album_set}"
+
+
 def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResult:
     """NUCLEO PURO (sin red): dado el HTML, devuelve el resultado. Esto es lo
     que testeamos con fixtures — es determinista y no toca la red."""
@@ -2346,6 +2377,9 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     images_available = (max(album_total, len(images))
                         if album_total is not None else
                         (len(images) or None))
+    # El set/album se cosecha del HTML crudo: se filtra aun cuando la pagina da
+    # MURO (0 fotos vistas), y es la llave para pedir el album directo.
+    album_set = _detect_album_set(html)
 
     ok = bool(media or images)
     reason = "" if ok else (
@@ -2359,12 +2393,13 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
         formats=media, reason=reason,
         images=images, media_type=media_type,
         full_caption=caption, hashtags=hashtags,
-        images_available=images_available,
+        images_available=images_available, album_set=album_set,
         diagnostics={
             "dom_media": len(dom_media), "json_trees": len(json_trees),
             "raw_candidates": len(raws), "scored_media": len(scored),
             "scored_images": len(img_scored), "images_kept": len(images),
             "images_available": images_available,
+            "album_set": album_set,
             "media_type": media_type,
             "top_scores": [(c.url[:80], c.score, c.height) for c in media[:5]],
             "top_images": [(c.url[:80], c.score, c.width, c.height) for c in images[:5]],
@@ -2609,6 +2644,9 @@ def resolve(url: str, *, profile: Profile | None = None,
             res.images_available = max(
                 [n for n in (res.images_available, best.images_available)
                  if n is not None] or [len(res.images) or 0]) or None
+            # El set/album puede filtrarse en una puerta y no en otra (la de
+            # muro suele soltarlo). Lo conservamos para el ataque directo.
+            res.album_set = res.album_set or best.album_set
 
         if best is None or res.confidence > best.confidence or (res.ok and not best.ok):
             best = res
@@ -2616,8 +2654,47 @@ def resolve(url: str, *, profile: Profile | None = None,
             _remember_gate(_HOST_MEMORY, host,
                            (a["is_rw"], a["ua_kind"]))       # recordar el ganador
             break   # suficientemente bueno: no gastamos mas red (RAPIDO)
+
+    # EXPANSION DE ALBUM DE FACEBOOK (sin cookies). Verificado en vivo: el link
+    # /share/ y el post dan MURO o solo el preview, pero FILTRAN el id del album
+    # (set=a.NNN). La URL DIRECTA del album, /media/set/?set=a.NNN, Facebook SI
+    # se la sirve a Googlebot -> el album COMPLETO (11/11). Solo se dispara si
+    # SABEMOS que faltan fotos, asi que un post normal no paga ni un fetch de
+    # mas. Degrada limpio: si algo falla, se queda con lo que ya tenia.
+    best = _expand_fb_album(best, host, fetch)
     return best if best else ResolveResult(False, url, "none", 0.0,
                                            reason="Sin intentos posibles.")
+
+
+def _expand_fb_album(res: "ResolveResult | None", host: str, fetch):
+    """Si es un album de Facebook al que le faltan fotos y conocemos su set,
+    pide la URL directa del album a Googlebot y adopta el juego COMPLETO de
+    fotos. No toca nada mas (titulo/caption/video se conservan). Best-effort."""
+    if not res or "facebook" not in host or not res.album_set:
+        return res
+    faltan = ((res.images_available or 0) > len(res.images)
+              or len(res.images) < 2)          # muro: no vimos ni el carrusel
+    if not faltan:
+        return res
+    album_url = _facebook_album_url(res.album_set)
+    try:
+        raw, _f = fetch(album_url, _GOOGLEBOT_UA,
+                        max_bytes=_MAX_HTML_BYTES, referer=res.url)
+        alb = resolve_html(raw.decode("utf-8", errors="replace"), album_url,
+                           strategy=(res.strategy or "facebook") + "+albumset")
+    except Exception:
+        return res                              # sin red / bloqueado: como antes
+    # Solo adoptamos si el album trajo MAS fotos que las que ya teniamos.
+    if len(alb.images) > len(res.images):
+        res.images = alb.images
+        res.images_available = max(res.images_available or 0,
+                                   alb.images_available or 0, len(alb.images))
+        res.strategy = alb.strategy
+        if len(alb.images) >= 2 and res.media_type in ("none", "image", "audio"):
+            res.media_type = "carousel"
+        if not res.thumbnail:
+            res.thumbnail = alb.thumbnail
+    return res
 
 
 # HTML minimo con la estructura real de un <video data-sources> de LinkedIn.

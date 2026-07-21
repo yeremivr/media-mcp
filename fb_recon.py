@@ -183,8 +183,47 @@ def main():
     else:
         print("🔴 Ni el album directo ni los permalinks sueltan las fotos a un "
               "anonimo. Aqui FB exige sesion de verdad: cookies como respaldo.")
+    _fase4_forense(url)
     print("\nPega esta salida completa y decidimos el cableado con datos.\n")
     return 0
+
+
+def _fase4_forense(url: str):
+    """Corre el MOTOR REAL (resolve completo, con expansion de album) y dumpea
+    la evidencia que no se ve de otra forma: de donde sale cada FORMATO (para
+    cazar el 'video' fantasma por su PROCEDENCIA) y si las fotos del album
+    DE VERDAD se descargan (prueba bytes en 3)."""
+    print("\n### FASE 4 — FORENSE DEL MOTOR REAL (resolve completo)")
+    try:
+        res = R.resolve(url)
+    except Exception as e:
+        print(f"  resolve() fallo: {e}")
+        return
+    print(f"  media_type={res.media_type}  images={len(res.images)}  "
+          f"images_available={res.images_available}  album_set={res.album_set}")
+    print(f"  strategy={res.strategy}")
+    print("\n  FORMATOS (aqui vive el 'video' fantasma; mira su PROCEDENCIA):")
+    if not res.formats:
+        print("    (ninguno)")
+    for f in res.formats:
+        print(f"    [{f.kind:5}] h={f.height} score={f.score}")
+        print(f"        url: {f.url[:96]}")
+        print(f"        prov: {f.provenance}")
+    print("\n  FOTOS del album (URL de cada una):")
+    for i, im in enumerate(res.images[:14], 1):
+        print(f"    {i:2}. {im.url[:100]}")
+    # ¿se descargan? probamos las 3 primeras con la puerta que abrio la pagina.
+    print("\n  PRUEBA DE DESCARGA (primeras 3 fotos):")
+    for i, im in enumerate(res.images[:3], 1):
+        try:
+            got = R.fetch_image_bytes(im.url, referer=url, prefer_gate=res.strategy)
+            if got:
+                print(f"    {i}. OK  {len(got[0])//1024} KB  ({got[1]})")
+            else:
+                print(f"    {i}. FALLO (ninguna puerta devolvio imagen real)")
+        except Exception as e:
+            print(f"    {i}. ERROR {str(e)[:50]}")
+    print("-" * 70)
 
 
 if __name__ == "__main__":

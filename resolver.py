@@ -890,7 +890,18 @@ def score_candidate(rc: RawCandidate, page_url: str) -> MediaCandidate | None:
     # NOMBRE: la clave `audio_url` o el ancestro `story_media_metadata`. Un
     # video real trae su propio stream por `browser_native_*`/`playable_url`,
     # nunca por `audio_url`, asi que esta senal no toca a los videos de verdad.
-    is_bg_audio = ("audio" in key_l) or ("story_media_metadata" in anc_l)
+    #
+    # AMPLIADO tras verlo fallar EN VIVO con un album real: Facebook NO siempre
+    # llama a la musica `audio_url` bajo `story_media_metadata`. La misma pista
+    # aparece bajo otros nombres (music/sound/song/original_sound/reels_audio).
+    # La regla robusta: si un candidato tiene pinta de video por su URL pero su
+    # CLAVE o algun ANCESTRO habla de audio/musica/sonido, es la pista de fondo,
+    # no el video del post. Un video de verdad cuelga de video/media/attachment,
+    # jamas de una rama que se llame audio/music/sound -> los videos no se tocan.
+    _AUDIO_NAME_HINT = ("audio", "music", "sound", "song", "original_sound",
+                        "reels_audio", "story_media_metadata")
+    is_bg_audio = (any(h in key_l for h in _AUDIO_NAME_HINT)
+                   or any(h in anc_l for h in _AUDIO_NAME_HINT))
 
     s = 0.0
     feats = []
@@ -2296,7 +2307,13 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     # caratula, y colarla aqui hacia que la red de seguridad por-ancla tomara
     # la 1a foto del album (que suele ser el og:image) por "portada del video"
     # y la borrara -> el album de 4 salia con 3.
-    real_videos = [c for c in media if c.kind == "video"]
+    # BLINDAJE: un "video" SIN altura, SIN ancho y SIN bitrate no es un
+    # reproducible identificado — es una corazonada (o la pista de musica que se
+    # escapo de is_bg_audio). Un video real de FB/IG SIEMPRE trae dimensiones
+    # (el reel: 720x1280). Exigirlas aqui evita que un fantasma sin medidas
+    # tire la 1a foto del album como si fuera su "portada".
+    real_videos = [c for c in media
+                   if c.kind == "video" and (c.height or c.width or c.tbr)]
     images = group_images(
         drop_video_posters(
             keep_authoritative([c for c in img_scored
@@ -2341,7 +2358,10 @@ def resolve_html(html: str, page_url: str, *, strategy: str = "") -> ResolveResu
     # (Se mira `has_real_video`, no `media`: un album con musica de fondo tiene
     # `media`=[esa pista de audio], pero su confianza debe salir de las fotos,
     # que son el medio principal, no de la cancion.)
-    has_real_video = any(c.kind == "video" for c in media)
+    # "Real" exige EVIDENCIA de video (dimensiones o bitrate): un cauce-v-0 sin
+    # medidas no debe marcar el post como video ni ganarle a un album de fotos.
+    has_real_video = any(c.kind == "video" and (c.height or c.width or c.tbr)
+                         for c in media)
     if not has_real_video and images:
         top_i = max(c.score for c in images)
         conf = round(min(1.0, top_i / 100.0) * 0.85, 3)

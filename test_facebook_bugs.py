@@ -126,6 +126,29 @@ def main():
                 rv.formats and "hd_reel.mp4" in rv.formats[0].url
                 and rv.formats[0].kind == "video")
 
+    print("\n=== BUG A (caso real): la musica bajo una clave DISTINTA igual se caza ===")
+    # En vivo, la musica NO venia como story_media_metadata.audio_url, sino bajo
+    # otro nombre (music/original_sound) y SIN dimensiones -> se colaba como
+    # cauce-v-0. Doble red: (a) ancestro con "music"/"sound", (b) un "video" sin
+    # altura/ancho/bitrate no cuenta como video real.
+    FB_ALBUM_MUSIC_ALT = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:image" content="https://scontent.fbcdn.net/v/t39.0/x1.jpg?oh=A&oe=1">'
+        '</head><body><script>{"story":{'
+        '"music_attachment":{"song":{"url":'
+        '"https:\\/\\/video.fbcdn.net\\/v\\/t42.1790-2\\/tune.mp4?efg=x&oh=M&oe=1"}},'
+        '"attachments":[{"styles":{"attachment":{"all_subattachments":{"count":3,"nodes":['
+        '{"media":{"image":{"uri":"https:\\/\\/scontent.fbcdn.net\\/v\\/t39.0\\/x1.jpg?oh=A&oe=1","width":960,"height":720}}},'
+        '{"media":{"image":{"uri":"https:\\/\\/scontent.fbcdn.net\\/v\\/t39.0\\/x2.jpg?oh=B&oe=1","width":960,"height":720}}},'
+        '{"media":{"image":{"uri":"https:\\/\\/scontent.fbcdn.net\\/v\\/t39.0\\/x3.jpg?oh=C&oe=1","width":960,"height":720}}}'
+        ']}}}}]}}</script></body></html>')
+    rm = R.resolve_html(FB_ALBUM_MUSIC_ALT, "https://www.facebook.com/p/xyz/posts/1")
+    ok &= check("con la musica bajo 'song/music_attachment' -> sigue 'carousel'",
+                rm.media_type == "carousel")
+    ok &= check("ningun formato de video fantasma (h/w/tbr vacios) sobrevive",
+                all(f.kind != "video" for f in rm.formats))
+    ok &= check("y las 3 fotos se detectan enteras", len(rm.images) == 3)
+
     print("\n=== BUG A (regresion): Instagram intacto (3 fotos, sin fantasmas) ===")
     ri = R.resolve_html(INSTAGRAM_SIDECAR, "https://www.instagram.com/p/ABC/")
     ok &= check("el sidecar de IG sigue siendo 'carousel' de 3",

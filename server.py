@@ -1000,6 +1000,12 @@ def _curate_resolver(info: dict) -> dict:
     # ninguna plataforma: un subtitulo se llama igual en todas partes.
     SUBS = ("vtt", "srt", "ttml", "dfxp", "sbv", "ass", "sub")
     SUB_HINT = re.compile(r"webvtt|captions?|subtitle|/track/", re.I)
+    # ¿El post trae un album de fotos? Si es asi, un "video" SIN altura NI
+    # bitrate es un FANTASMA: la pista de musica de fondo que el resolver no
+    # logro reclasificar como audio. En un album no debe ofrecerse como video
+    # descargable (bajaba la cancion y nunca aparecia nada reproducible). Un
+    # video REAL —aun mezclado con fotos— trae altura; este blindaje no lo toca.
+    has_album = bool(info.get("_cauce_images"))
     for f, elem in zip(fmts_in, elems):
         if str(f.get("ext") or "").lower() in SUBS:
             continue
@@ -1009,6 +1015,8 @@ def _curate_resolver(info: dict) -> dict:
         muxed = f.get("_cauce_muxed", True)
         h = f.get("height") or 0
         tbr = f.get("tbr")
+        if has_album and muxed and not h and not tbr:
+            continue                     # video fantasma (musica) en un album
         size_mb = round(tbr * 1000 / 8 * duration / 1_000_000, 1) if (tbr and duration) else 0
         if muxed:
             # La deduplicacion por altura vale DENTRO de un elemento (mismo

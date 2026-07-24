@@ -64,6 +64,7 @@ import subprocess
 import urllib.request
 from urllib.parse import urlparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
 from mcp.server.fastmcp import FastMCP
@@ -351,6 +352,12 @@ _URL_STRATEGY: dict = {}
 # peleen la CPU/red a la vez. Semaforo simple (2 en paralelo, configurable).
 _DL_SEMAPHORE = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_DL", "2")))
 
+# Las FOTOS de un carrusel son GET independientes al CDN: bajarlas en serie
+# eran N viajes de red en fila. En paralelo el carrusel entero cuesta ~1 viaje
+# (limitado por este pool). No es descarga pesada (una foto pesa KB, no MB como
+# un video), por eso no comparte el semaforo de video: son cuellos distintos.
+_IMG_FETCH_WORKERS = int(os.environ.get("IMG_FETCH_WORKERS", "6"))
+
 # Altura "suficientemente buena": si un cliente ya da >= esto, dejamos de
 # probar mas clientes (evita latencia en el caso normal).
 GOOD_ENOUGH_HEIGHT = int(os.environ.get("GOOD_ENOUGH_HEIGHT", "720"))
@@ -544,31 +551,63 @@ def _resolve_cached(url: str, *, fresh: bool = False):
     return res
 
 
+# Pool para lanzar el resolver ESPECULATIVAMENTE, en paralelo con yt-dlp.
+# Antes el flujo era en SERIE: yt-dlp entero -> (si no sirve) resolver entero,
+# o sea se pagaba la SUMA de los dos viajes de red. Como el resolver es la red
+# de seguridad para carruseles/fotos (justo donde yt-dlp no sirve), arrancarlo
+# a la vez que yt-dlp hace que su fetch ya este hecho cuando yt-dlp falla: se
+# paga el MAXIMO, no la suma. El cuello de botella siempre fue la red, no la CPU.
+_RESOLVER_POOL = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("RESOLVER_POOL", "4")),
+    thread_name_prefix="resolver")
+
+
+def _resolve_speculative(url: str):
+    """El resolver, tragandose cualquier error (corre en un hilo del pool cuyo
+    resultado a veces NUNCA se cobra: si yt-dlp gana, este future queda huerfano
+    a proposito — igual deja la pagina cacheada en `_RESOLVE_CACHE` para que la
+    descarga de fotos que venga despues no vuelva a bajarla)."""
+    try:
+        return _resolve_cached(url)
+    except Exception:
+        return None
+
+
 def _extract_info(url: str) -> dict:
     """Extrae metadata + formatos, con RED DE SEGURIDAD estructural.
 
-    yt-dlp va PRIMERO (rapido y mantenido). Para enlaces que NO son YouTube, si
-    yt-dlp no tiene extractor o su extractor se rompio (no devuelve formatos
-    usables), caemos al `resolver` estructural (grafo + scoring del HTML).
-    YouTube NO usa el resolver: sus URLs de googlevideo necesitan el descifrado
-    de firma que solo yt-dlp sabe hacer, y ese camino ya tiene su cascada."""
+    YouTube: solo yt-dlp (sus URLs de googlevideo necesitan el descifrado de
+    firma que solo yt-dlp sabe hacer, y ese camino ya tiene su propia cascada).
+
+    Resto: yt-dlp y el resolver estructural corren EN PARALELO. yt-dlp suele
+    ganar en videos sueltos (TikTok/reel) y se devuelve al instante; en fotos y
+    carruseles yt-dlp no da formatos usables y entonces se cobra el resolver,
+    que YA venia resolviendo -> sin el peaje en serie de antes."""
+    if _is_youtube(url) or _resolver is None:
+        return _extract_info_ytdlp(url)
+
+    # Arranca el resolver YA, antes de yt-dlp, para que ambos se solapen.
+    resolver_future = _RESOLVER_POOL.submit(_resolve_speculative, url)
+
     ytdlp_err = None
     try:
         info = _extract_info_ytdlp(url)
-        if _is_youtube(url) or _has_real_formats(info):
+        if _has_real_formats(info):
+            # yt-dlp basto: el resolver sigue en background y deja la pagina
+            # cacheada (util si el post ademas trae fotos), sin costar latencia.
             return info
     except Exception as e:
         if _classify_error(e) == "hard":
             raise
         ytdlp_err = e
 
-    if not _is_youtube(url) and _resolver is not None:
-        try:
-            res = _resolve_cached(url)
-        except Exception:
-            res = None
-        if res is not None and getattr(res, "ok", False):
-            return res.to_info()
+    # yt-dlp no dio nada usable -> cobramos el resolver (ya estaba en vuelo).
+    try:
+        res = resolver_future.result()
+    except Exception:
+        res = None
+    if res is not None and getattr(res, "ok", False):
+        return res.to_info()
 
     if ytdlp_err is not None:
         raise ytdlp_err
@@ -883,12 +922,26 @@ def _download_images_worker(job: dict):
 
         stem = _safe_stem(res.title, f"cauce_{job_id}")
         files, errors = [], []
-        for i in picked:
-            cand = imgs[i - 1]
+
+        # Cada foto es un GET independiente al CDN: en serie eran N viajes en
+        # fila (un carrusel de 10 = 10 esperas). En paralelo el carrusel cuesta
+        # ~1 viaje. `prefer_gate` hace que cada hilo arranque con la puerta que
+        # abrio la pagina, asi que aciertan al primer intento aunque salgan a la
+        # vez; la 1a que confirme la puerta la deja en _MEDIA_GATE_MEMORY (escritura
+        # atomica bajo el GIL) para las siguientes. Se escribe en ORDEN de
+        # carrusel despues, porque el nombre lleva el indice.
+        def _fetch_one(i):
             # `prefer_gate`: la puerta que abrio la pagina abre tambien la
             # foto (Facebook sirve las suyas por un endpoint de crawler).
-            got = _resolver.fetch_image_bytes(
-                cand.url, referer=url, prefer_gate=res.strategy)
+            return _resolver.fetch_image_bytes(
+                imgs[i - 1].url, referer=url, prefer_gate=res.strategy)
+
+        workers = min(len(picked), _IMG_FETCH_WORKERS)
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="imgdl") as ex:
+            fetched = list(ex.map(_fetch_one, picked))   # mismo orden que picked
+
+        for i, got in zip(picked, fetched):
             if not got:
                 errors.append(i)
                 continue

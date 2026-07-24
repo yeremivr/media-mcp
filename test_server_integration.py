@@ -330,6 +330,94 @@ def main():
     ok &= check("pero un carrusel de 5 videos sigue lanzando 5",
                 len(_trabajos(cur)) == 5)
 
+    # ---- 4. EXTRACCION PARALELA: yt-dlp y el resolver corren A LA VEZ ----
+    # Antes era en SERIE (yt-dlp entero -> si no sirve, resolver entero = SUMA
+    # de dos viajes de red). Ahora se solapan y se paga el MAXIMO. El contrato
+    # observable no cambia (yt-dlp gana si da formatos; si no, el resolver), y
+    # ademas un resolver especulativo que reviente jamas debe tumbar la extraccion.
+    print("\n=== EXTRACCION PARALELA: yt-dlp gana; resolver especulativo que peta no estorba ===")
+
+    def ydl_real(url, download):
+        if "private" in url:
+            raise RuntimeError("ERROR: Video unavailable: this content is not available")
+        return {"title": "Reel", "formats": [
+            {"format_id": "hd", "vcodec": "h264", "acodec": "aac", "height": 1080}]}
+
+    _install_stubs(fake_ydl_factory=ydl_real)
+    del sys.modules["server"]
+    import server as server3
+    server3._resolver = resolver
+
+    # (a) yt-dlp da formatos -> gana al instante. El resolver corre en paralelo
+    #     y aqui REVIENTA a proposito: no debe tumbar lo que yt-dlp resolvio.
+    def _boom(u):
+        raise RuntimeError("el resolver especulativo peto a proposito")
+    resolver.resolve = _boom
+    info3 = server3._extract_info("https://www.instagram.com/reel/XYZ/")
+    ok &= check("yt-dlp con formatos reales gana (no cae al resolver)",
+                not info3.get("_cauce_resolver") and server3._has_real_formats(info3))
+    ok &= check("un resolver especulativo que PETA no tumba la extraccion",
+                info3.get("title") == "Reel")
+
+    # (b) error DURO (privado/borrado): se propaga y el resolver NO lo enmascara,
+    #     aunque tuviera algo que ofrecer (no se reintenta lo que no tiene arreglo).
+    class _ResConAlgo:
+        ok = True
+        def to_info(self):
+            return {"_cauce_resolver": True, "title": "no deberia verse"}
+    resolver.resolve = lambda u: _ResConAlgo()
+    duro = False
+    try:
+        server3._extract_info("https://www.instagram.com/reel/private/1/")
+    except Exception as e:
+        duro = "unavailable" in str(e).lower()
+    ok &= check("un error DURO se propaga; el resolver no lo enmascara", duro)
+
+    # ---- 5. FOTOS EN PARALELO: orden de carrusel preservado, fallos aislados ----
+    # Las fotos eran GET en fila (N viajes). Ahora salen en paralelo, pero el
+    # nombre lleva el indice y se escriben en orden -> la galeria las ordena
+    # igual que el carrusel, y una foto que falle en el CDN no arrastra al resto.
+    print("\n=== FOTOS EN PARALELO: orden de carrusel preservado, fallos aislados ===")
+    import re as _re
+    import tempfile as _tmp
+    import pathlib as _pl
+    d = _pl.Path(_tmp.mkdtemp())
+    server3.DOWNLOAD_DIR = d
+    server3.JOBS_INDEX = d / "jobs.json"
+    server3._resolver = resolver
+
+    class _Img:
+        def __init__(self, u):
+            self.url = u
+
+    class _ResImgs:
+        ok = True
+        title = "Album"; uploader = "Autor"; thumbnail = "t"; reason = ""
+        strategy = "instagram:googlebot:original"
+        images = [_Img(f"https://cdn/img{i}.jpg") for i in range(1, 6)]   # 5 fotos
+
+    server3._RESOLVE_CACHE.clear()
+    resolver.resolve = lambda u: _ResImgs()
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32                 # magic bytes JPEG
+
+    def _fake_fetch(url, referer=None, prefer_gate=None, **k):
+        if "img3.jpg" in url:                                 # la 3 "falla" en el CDN
+            return None
+        return (JPEG, "image/jpeg")
+
+    resolver.fetch_image_bytes = _fake_fetch
+    job = {"job_id": "imgs01", "url": "https://www.instagram.com/p/ABC/", "which": "all"}
+    server3._download_images_worker(job)
+    fin = server3._get_job("imgs01") or {}
+    ok &= check("bajo 4 de 5 fotos (la 3 fallo en el CDN)", fin.get("downloaded") == 4)
+    ok &= check("la foto que fallo queda aislada, no rompe el lote",
+                fin.get("failed") == [3])
+    names = [_pl.Path(f).name for f in (fin.get("files") or [])]
+    idxs = [int(_re.search(r"_(\d\d)_", n).group(1)) for n in names]
+    ok &= check("los ficheros conservan el ORDEN del carrusel (1,2,4,5)",
+                idxs == [1, 2, 4, 5])
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

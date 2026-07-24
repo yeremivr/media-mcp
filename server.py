@@ -54,6 +54,7 @@ import re
 import json
 import uuid
 import time
+import heapq
 import base64
 import shlex
 import socket
@@ -348,9 +349,90 @@ _CHAMPION = {"name": None}
 # download (para pedir el mismo format_id al mismo cliente).
 _URL_STRATEGY: dict = {}
 
-# El telefono tiene recursos limitados: no dejar que descargas pesadas se
-# peleen la CPU/red a la vez. Semaforo simple (2 en paralelo, configurable).
-_DL_SEMAPHORE = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_DL", "2")))
+# ==========================================================================
+# COLA DE DESCARGAS POR PRIORIDAD  (min-heap explicito + pool de workers)
+# ==========================================================================
+# Antes: un HILO por descarga + un Semaphore(2). Problema: cuando `grab` cae
+# sobre un post MIXTO dispara ~7 trabajos de golpe (2 fotos + 5 videos) y el
+# orden en que corren —y por tanto en que aparecen en la galeria— quedaba a
+# merced del planeador de hilos del SO. Indefinido e injusto.
+#
+# Ahora: los trabajos entran a un MIN-HEAP (heapq, O(log n) push/pop) del que
+# tira un pool fijo de workers. El heap ordena por (tier, tamano, secuencia):
+#   - tier 0 = FOTOS (pesan KB, terminan casi al instante) -> SIEMPRE primero,
+#     asi el usuario ve algo de inmediato;
+#   - tier 1 = VIDEO, y dentro del video el MAS LIVIANO primero (shortest-job-
+#     first). SJF es un resultado clasico de scheduling: MINIMIZA el tiempo
+#     medio de espera -> el usuario ve resultados cuanto antes.
+#   - la secuencia (contador unico) desempata en FIFO y ademas garantiza que la
+#     tupla NUNCA compara el objeto-tarea (heapq compara elemento a elemento y
+#     se detiene en la secuencia, que es unica).
+#
+# Se usa heapq crudo bajo una Condition (en vez de queue.PriorityQueue) para
+# tener el desempate y el tamano del heap a la vista (health lo expone).
+_DL_POOL_SIZE = int(os.environ.get("MAX_PARALLEL_DL", "2"))
+_DL_UNKNOWN_MB = 40.0     # video de tamano desconocido: ni el mas ligero ni el mas pesado
+_DL_HEAP: list = []       # items (tier, size_mb, seq, task)
+_DL_CV = threading.Condition()
+_DL_SEQ = 0               # contador monotono: desempate FIFO + tupla siempre comparable
+
+
+class _DLTask:
+    """Un trabajo en la cola. El Event lo espera la tool que lo encolo (para que
+    los clips cortos respondan 'listo' ya); lo levanta el worker al terminar.
+    Vive SOLO en memoria (no se serializa al JSON de jobs)."""
+    __slots__ = ("job", "kind", "event")
+
+    def __init__(self, job: dict, kind: str):
+        self.job = job
+        self.kind = kind
+        self.event = threading.Event()
+
+
+def _dl_enqueue(task: "_DLTask", tier: int, size: float) -> None:
+    global _DL_SEQ
+    with _DL_CV:
+        heapq.heappush(_DL_HEAP, (tier, size, _DL_SEQ, task))
+        _DL_SEQ += 1
+        _DL_CV.notify()          # despierta a UN worker dormido
+
+
+def _dl_pop() -> "_DLTask":
+    with _DL_CV:
+        while not _DL_HEAP:
+            _DL_CV.wait()        # se duerme sin gastar CPU hasta que llegue algo
+        return heapq.heappop(_DL_HEAP)[3]
+
+
+def _dl_depth() -> int:
+    with _DL_CV:
+        return len(_DL_HEAP)
+
+
+def _dl_worker_loop() -> None:
+    """Un worker del pool: saca el trabajo de MENOR prioridad y lo ejecuta. Los
+    bodies (_download_worker/_download_images_worker) ya capturan y registran su
+    propio error; el try de aqui es la red final para que un worker jamas muera
+    y deje la cola sin atender."""
+    while True:
+        task = _dl_pop()
+        try:
+            if task.kind == "images":
+                _download_images_worker(task.job)
+            else:
+                _download_worker(task.job)
+        except Exception:
+            pass
+        finally:
+            task.event.set()     # avisa a quien espere (la tool) que ya termino
+
+
+# Arranca el pool UNA vez, al importar el modulo (los workers duermen en la
+# Condition hasta que haya trabajo). El tamano del pool ES el limite de
+# concurrencia (reemplaza al semaforo anterior).
+for _w in range(_DL_POOL_SIZE):
+    threading.Thread(target=_dl_worker_loop, daemon=True,
+                     name=f"dlworker-{_w}").start()
 
 # Las FOTOS de un carrusel son GET independientes al CDN: bajarlas en serie
 # eran N viajes de red en fila. En paralelo el carrusel entero cuesta ~1 viaje
@@ -756,12 +838,12 @@ def _do_download_resolved(job_id: str, url: str, format_id: str):
             di["height"] = chosen.height
         return di, filepath
 
-    with _DL_SEMAPHORE:
-        return action(_base_opts(None))
+    # El pool de workers ya acota la concurrencia; aqui solo se ejecuta.
+    return action(_base_opts(None))
 
 
 def _do_download(job_id: str, url: str, format_id: str):
-    """Descarga real con yt-dlp, bajo el semaforo y via la cascada."""
+    """Descarga real con yt-dlp (corre dentro de un worker del pool, via la cascada)."""
     if format_id.startswith("cauce-") and _resolver is not None:
         return _do_download_resolved(job_id, url, format_id)
     out_template = str(DOWNLOAD_DIR / f"{job_id}_%(title).80s.%(ext)s")
@@ -778,8 +860,7 @@ def _do_download(job_id: str, url: str, format_id: str):
             filepath = reqd[-1].get("filepath") if reqd else ydl.prepare_filename(info)
             return info, filepath
 
-    with _DL_SEMAPHORE:
-        return _run_resilient(url, action)
+    return _run_resilient(url, action)
 
 
 def _download_worker(job: dict):
@@ -1304,12 +1385,17 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
             res["media_type"] = curated.get("media_type")
             return res
         # Mixto: ademas de las fotos, un trabajo por cada video del post.
+        # Se ENCOLAN sin esperar cada uno (antes `download()` bloqueaba hasta 8s
+        # POR video -> 5 videos = hasta 40s de espera en serie). La cola de
+        # prioridad ya baja las fotos primero y ordena los videos por tamano;
+        # aqui solo devolvemos los job_id y todo drena en el pool.
         res["media_type"] = "mixed"
         res["videos_encontrados"] = len(vids)
         trabajos = []
         for v in vids:
             try:
-                trabajos.append(download(url, v["format_id"]).get("job_id"))
+                jid, _ = _submit_video(url, v["format_id"], size_mb=v.get("filesize_mb"))
+                trabajos.append(jid)
             except Exception as e:
                 trabajos.append(f"error: {e}")
         res["video_jobs"] = trabajos
@@ -1344,6 +1430,39 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
     return res
 
 
+def _submit_video(url: str, format_id: str, size_mb: float | None = None):
+    """Crea el job de VIDEO y lo ENCOLA (sin esperar). Devuelve (job_id, task).
+    `size_mb` (si se conoce) alimenta el shortest-job-first: el video mas liviano
+    corre antes. Desconocido -> tamano neutro (ni el primero ni el ultimo)."""
+    job_id = str(uuid.uuid4())[:8]
+    job = {
+        "job_id": job_id, "url": url, "format_id": format_id,
+        "status": "downloading", "title": None,
+        "created_at": _now(), "updated_at": _now(),
+    }
+    _upsert_job(job)
+    task = _DLTask(job, "video")
+    size = size_mb if (size_mb and size_mb > 0) else _DL_UNKNOWN_MB
+    _dl_enqueue(task, tier=1, size=float(size))     # tier 1 = video (despues de fotos)
+    return job_id, task
+
+
+def _submit_images(url: str, which: str):
+    """Crea el job de FOTOS y lo ENCOLA con MAXIMA prioridad (tier 0: pesan KB,
+    aparecen casi al instante). Devuelve (job_id, task)."""
+    job_id = str(uuid.uuid4())[:8]
+    job = {
+        "job_id": job_id, "url": url, "kind": "images",
+        "which": which or "all", "format_id": f"cauce-img:{which or 'all'}",
+        "status": "downloading", "title": None,
+        "created_at": _now(), "updated_at": _now(),
+    }
+    _upsert_job(job)
+    task = _DLTask(job, "images")
+    _dl_enqueue(task, tier=0, size=0.0)             # tier 0 = fotos, van primero
+    return job_id, task
+
+
 @mcp.tool()
 def download(url: str, format_id: str) -> dict:
     """
@@ -1360,23 +1479,13 @@ def download(url: str, format_id: str) -> dict:
         url: el link original.
         format_id: el format_id devuelto por list_formats (ej. la mejor calidad).
     """
-    job_id = str(uuid.uuid4())[:8]
-    job = {
-        "job_id": job_id,
-        "url": url,
-        "format_id": format_id,
-        "status": "downloading",
-        "title": None,
-        "created_at": _now(),
-        "updated_at": _now(),
-    }
-    _upsert_job(job)
+    job_id, task = _submit_video(url, format_id)
+    # Espera breve: clips cortos terminan aqui y responden "listo"; los largos
+    # siguen en el pool y avisan por notificacion. (Antes: thread.join; ahora el
+    # worker levanta el Event al terminar -> mismo contrato, con cola de prioridad.)
+    task.event.wait(DOWNLOAD_WAIT_SECONDS)
 
-    t = threading.Thread(target=_download_worker, args=(job,), daemon=True)
-    t.start()
-    t.join(timeout=DOWNLOAD_WAIT_SECONDS)   # espera breve: clips cortos terminan aqui
-
-    fresh = _get_job(job_id) or job
+    fresh = _get_job(job_id) or task.job
     status = fresh.get("status")
 
     if status == "done":
@@ -1416,25 +1525,10 @@ def download_images(url: str, which: str = "all") -> dict:
     if _resolver is None:
         return {"ok": False, "error": "El motor resolver no esta disponible en este server."}
 
-    job_id = str(uuid.uuid4())[:8]
-    job = {
-        "job_id": job_id,
-        "url": url,
-        "kind": "images",
-        "which": which or "all",
-        "format_id": f"cauce-img:{which or 'all'}",
-        "status": "downloading",
-        "title": None,
-        "created_at": _now(),
-        "updated_at": _now(),
-    }
-    _upsert_job(job)
+    job_id, task = _submit_images(url, which)
+    task.event.wait(DOWNLOAD_WAIT_SECONDS)
 
-    t = threading.Thread(target=_download_images_worker, args=(job,), daemon=True)
-    t.start()
-    t.join(timeout=DOWNLOAD_WAIT_SECONDS)
-
-    fresh = _get_job(job_id) or job
+    fresh = _get_job(job_id) or task.job
     status = fresh.get("status")
     if status == "done":
         return {"ok": True, "job_id": job_id, "status": "done",
@@ -1623,6 +1717,8 @@ def health_check() -> dict:
             "youtube_strategy": _CHAMPION["name"],
             "max_height": _max_height(info),
             "download_dir": str(DOWNLOAD_DIR),
+            "dl_pool": _DL_POOL_SIZE,     # workers del pool = limite de concurrencia
+            "dl_queue": _dl_depth(),      # trabajos esperando en el min-heap
             "title": info.get("title"),
         }
     except Exception as e:

@@ -418,6 +418,61 @@ def main():
     ok &= check("los ficheros conservan el ORDEN del carrusel (1,2,4,5)",
                 idxs == [1, 2, 4, 5])
 
+    # ---- 6. COLA DE PRIORIDAD (min-heap): orden de ejecucion ----
+    # Antes: un hilo por job + semaforo -> el orden lo decidia el planeador del
+    # SO. Ahora un min-heap ordena por (tier, tamano, secuencia): fotos primero
+    # (tier 0, aparecen ya), luego videos del mas liviano al mas pesado (SJF),
+    # y FIFO para desempatar. Se congela el 'notify' del pool para que enqueue
+    # empuje al heap sin que los workers roben items -> pop determinista.
+    print("\n=== COLA DE PRIORIDAD (min-heap): fotos primero, videos por tamano (SJF) ===")
+    server3._DL_HEAP.clear()
+    server3._DL_SEQ = 0
+    server3._DL_CV.notify = lambda *a, **k: None   # congela el pool durante la prueba
+    try:
+        # Llegan DESORDENADOS: video grande, foto1, video chico, video medio, foto2.
+        _, t_big = server3._submit_video("u", "big", size_mb=200)
+        _, t_ph1 = server3._submit_images("u", "all")
+        _, t_sm = server3._submit_video("u", "small", size_mb=5)
+        _, t_med = server3._submit_video("u", "med", size_mb=50)
+        _, t_ph2 = server3._submit_images("u2", "all")
+        popped = [server3._dl_pop() for _ in range(5)]
+    finally:
+        del server3._DL_CV.notify                  # restaura el pool real
+    ok &= check("las 2 FOTOS salen primero (tier 0), en orden de llegada (FIFO)",
+                popped[0] is t_ph1 and popped[1] is t_ph2)
+    ok &= check("luego los VIDEOS por tamano ascendente (SJF): small<med<big",
+                popped[2] is t_sm and popped[3] is t_med and popped[4] is t_big)
+    ok &= check("un video de tamano DESCONOCIDO cae en el medio (ni 1o ni ultimo)",
+                0 < server3._DL_UNKNOWN_MB < 200)
+
+    # ---- 7. CONTRATO DE download() intacto: el Event lo resuelve el pool ----
+    # download() ya no lanza su propio hilo: encola y espera el Event que el
+    # worker levanta al terminar. Debe seguir devolviendo 'done' si el trabajo
+    # termina dentro de la ventana, y 'downloading' si se pasa (sigue en el pool).
+    print("\n=== CONTRATO download(): 'done' rapido, 'downloading' si tarda (via el pool) ===")
+    import time as _t
+
+    def _fast_done(job):
+        job.update({"status": "done", "title": "OK"})
+        server3._upsert_job(job)
+
+    server3._download_worker = _fast_done
+    server3.DOWNLOAD_WAIT_SECONDS = 3.0
+    r = server3.download("https://x/v", "137+bestaudio/best")
+    ok &= check("download() responde 'done' cuando el worker termina a tiempo",
+                r.get("status") == "done" and r.get("ok") is True)
+
+    def _slow(job):
+        _t.sleep(1.0)                              # mas que la ventana de espera
+        job.update({"status": "done"})
+        server3._upsert_job(job)
+
+    server3._download_worker = _slow
+    server3.DOWNLOAD_WAIT_SECONDS = 0.3
+    r2 = server3.download("https://x/v2", "137+bestaudio/best")
+    ok &= check("download() responde 'downloading' si excede la ventana (sigue en el pool)",
+                r2.get("status") == "downloading")
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1

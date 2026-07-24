@@ -536,24 +536,43 @@ def _run_resilient(url: str, action, remember_for_url: bool = False):
     raise last_err if last_err else RuntimeError("YouTube: ninguna estrategia funciono")
 
 
-def _friendly_error(e: Exception) -> dict:
-    """Traduce el error crudo de yt-dlp segun su clasificacion."""
+def _friendly_error(e: Exception, url: str | None = None) -> dict:
+    """Traduce el error crudo segun su clasificacion Y la plataforma REAL.
+
+    BUG que arregla: `_classify_error` cae por defecto a 'botwall' ante un error
+    desconocido (util para YouTube, que reintenta con otro cliente), y el mensaje
+    de 'botwall' hablaba SIEMPRE de 'YouTube pidio verificacion anti-bot' +
+    needs_cookies. Resultado real observado: un reel de Facebook que fallaba (su
+    video pide login) mostraba una notificacion de YouTube pidiendo cookies de
+    YouTube — sin sentido. El mensaje ahora depende del dominio del enlace: solo
+    YouTube habla de YouTube; el resto recibe una explicacion honesta de su caso."""
     kind = _classify_error(e)
     if kind == "hard":
         return {"ok": False,
-                "error": "Ese video no se puede descargar: es privado, fue borrado, "
+                "error": "Ese contenido no se puede descargar: es privado, fue borrado, "
                          "es solo para miembros o no esta disponible en tu region."}
-    if kind == "auth":
-        return {"ok": False, "needs_cookies": True,
-                "error": "Este video tiene restriccion de edad y pide inicio de sesion. "
-                         "Hacen falta cookies de una cuenta de YouTube."}
-    if kind == "botwall":
-        return {"ok": False, "needs_cookies": True,
-                "error": ("YouTube pidio verificacion anti-bot y ninguna estrategia lo paso. "
-                          "Desde IP residencial/movil es raro; desde un datacenter es esperado "
-                          "(por eso Cauce corre mejor en tu telefono). TikTok, Instagram y "
-                          "Facebook no tienen este problema.")}
-    return {"ok": False, "error": f"No se pudo leer el link: {e}"}
+
+    # Sin url asumimos YouTube: el unico que llama sin url es health_check.
+    if url is None or _is_youtube(url):
+        if kind == "auth":
+            return {"ok": False, "needs_cookies": True,
+                    "error": "Este video tiene restriccion de edad y pide inicio de sesion. "
+                             "Hacen falta cookies de una cuenta de YouTube."}
+        if kind == "botwall":
+            return {"ok": False, "needs_cookies": True,
+                    "error": ("YouTube pidio verificacion anti-bot y ninguna estrategia lo paso. "
+                              "Desde IP residencial/movil es raro; desde un datacenter es esperado "
+                              "(por eso Cauce corre mejor en tu telefono). TikTok, Instagram y "
+                              "Facebook no tienen este problema.")}
+        return {"ok": False, "error": f"No se pudo leer el link: {e}"}
+
+    # --- NO es YouTube: ni 'anti-bot de YouTube' ni cookies de YouTube ayudan. ---
+    host = (urlparse(url).hostname or "el sitio").replace("www.", "")
+    return {"ok": False,
+            "error": (f"No pude sacar el video de {host}. Suele pasar cuando el post pide "
+                      "inicio de sesion o no expone el stream publico (muchos reels y stories "
+                      "de Facebook/Instagram lo bloquean sin login). Si el post tiene FOTOS, "
+                      "esas si las puedo bajar.")}
 
 
 mcp = FastMCP("media-mcp", host="0.0.0.0", port=PORT)
@@ -908,7 +927,7 @@ def _download_worker(job: dict):
         _notify(job_id, media_title, subtitle, filepath=filepath,
                 image_path=thumb, icon=icon)
     except Exception as e:
-        fe = _friendly_error(e)
+        fe = _friendly_error(e, job.get("url"))
         job.update({"status": "error", "error": fe.get("error", str(e)), "updated_at": _now()})
         _upsert_job(job)
         _notify(job_id, "No se pudo descargar", (fe.get("error") or str(e))[:120],
@@ -1254,7 +1273,7 @@ def list_formats(url: str) -> dict:
     try:
         info = _extract_info(url)
     except Exception as e:
-        return _friendly_error(e)
+        return _friendly_error(e, url)
     return _listing_from_info(info, url)
 
 
@@ -1373,7 +1392,7 @@ def grab(url: str, quality: str = "best", which: str = "all") -> dict:
     try:
         info = _extract_info(url)
     except Exception as e:
-        return _friendly_error(e)
+        return _friendly_error(e, url)
 
     curated = (_curate_resolver(info) if info.get("_cauce_resolver")
                else None)

@@ -473,6 +473,28 @@ def main():
     ok &= check("download() responde 'downloading' si excede la ventana (sigue en el pool)",
                 r2.get("status") == "downloading")
 
+    # ---- 8. MENSAJE DE ERROR CONSCIENTE DE LA PLATAFORMA ----
+    # Bug real capturado en vivo: un reel de Facebook que fallaba mostraba
+    # "YouTube pidio verificacion anti-bot" + needs_cookies (por el default
+    # 'botwall' de _classify_error, cuyo mensaje asumia YouTube SIEMPRE). El
+    # mensaje ahora depende del dominio del enlace.
+    print("\n=== MENSAJE DE ERROR SEGUN LA PLATAFORMA (el bug del 'YouTube' en Facebook) ===")
+    err = RuntimeError("Cannot parse data from the page")   # desconocido -> 'botwall'
+    fb = server3._friendly_error(err, "https://www.facebook.com/share/r/193ijQfq6C/")
+    ok &= check("un fallo de Facebook NO menciona YouTube",
+                "youtube" not in (fb.get("error") or "").lower())
+    ok &= check("un fallo de Facebook NO pide cookies de YouTube",
+                not fb.get("needs_cookies"))
+    ok &= check("y nombra el dominio REAL (facebook.com)",
+                "facebook.com" in (fb.get("error") or ""))
+    yt = server3._friendly_error(err, "https://www.youtube.com/watch?v=abc")
+    ok &= check("el MISMO error en YouTube SI habla de YouTube/anti-bot + cookies",
+                "youtube" in (yt.get("error") or "").lower() and yt.get("needs_cookies") is True)
+    hard = server3._friendly_error(RuntimeError("Private video"),
+                                   "https://www.facebook.com/x")
+    ok &= check("un error DURO (privado/borrado) sigue con su mensaje generico",
+                "privado" in (hard.get("error") or "").lower())
+
     print("\n" + "=" * 60)
     print("RESULTADO:", "TODO PASA (OK)" if ok else "HAY FALLOS (FAIL)")
     return 0 if ok else 1
